@@ -14,10 +14,30 @@ Usage:
 import argparse
 import sys
 import os
+import socket
+
+# Ensure standard output safely handles all terminal encodings on Windows
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import database as db
 import bot
 import web_server
+
+def get_lan_ip() -> str:
+    """Discovers the computer's local Wi-Fi / Ethernet LAN IP address."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 BANNER = r"""
   __  __ _             _       ___   ____        _   
@@ -38,8 +58,9 @@ def main():
     parser.add_argument("--sync", action="store_true", help="Sync your account User ID and status")
     parser.add_argument("--like-back", action="store_true", help="Run Like-Back routine on incoming likes")
     parser.add_argument("--search-like", action="store_true", help="Run Search & Auto-Like with criteria filters")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host for dashboard server (default: 127.0.0.1)")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host for dashboard server (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=5000, help="Port for dashboard server (default: 5000)")
+    parser.add_argument("--public", "--tunnel", action="store_true", help="Generate instant public HTTPS tunnel for phone access")
     parser.add_argument("--max-likes", type=int, default=None, help="Max likes limit override for CLI runs")
 
     args = parser.parse_args()
@@ -74,10 +95,29 @@ def main():
         # Default: Launch web dashboard (auto-detects Render PORT and HOST)
         env_port = os.environ.get("PORT")
         server_port = int(env_port) if env_port else args.port
-        default_host = "0.0.0.0" if (env_port or os.environ.get("RENDER")) else args.host
-        server_host = os.environ.get("HOST", default_host)
-        
-        print(f"[*] Starting Web Dashboard on http://{server_host}:{server_port}")
+        server_host = os.environ.get("HOST", args.host)
+        lan_ip = get_lan_ip()
+
+        tunnel_url = None
+        # Start instant public HTTPS tunnel if requested or on mobile
+        if args.public or os.environ.get("ENABLE_TUNNEL") == "1":
+            try:
+                from pycloudflared import try_cloudflare
+                print("[*] Creating instant secure Cloudflare HTTPS tunnel for phone access...")
+                t = try_cloudflare(server_port)
+                tunnel_url = t.tunnel
+            except Exception as e:
+                print(f"[-] Could not establish Cloudflare tunnel: {e}")
+
+        print("======================================================")
+        print("  Mingle2 Bot Server is LIVE & READY!")
+        print("======================================================")
+        print(f"  * Desktop Local URL:        http://localhost:{server_port}")
+        print(f"  * Android / iPhone (Wi-Fi): http://{lan_ip}:{server_port}")
+        if tunnel_url:
+            print(f"  * Public HTTPS URL:         {tunnel_url}")
+        print("======================================================\n")
+
         web_server.start_server(host=server_host, port=server_port)
 
 if __name__ == "__main__":

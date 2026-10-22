@@ -1077,7 +1077,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/action/stop", api_trigger_stop)
     return app
 
-def start_server(host: str = "127.0.0.1", port: int = 5000):
+def start_server(host: str = "0.0.0.0", port: int = 5000):
     db.init_db()
     final_host = os.environ.get("HOST", host)
     final_port = int(os.environ.get("PORT", port))
