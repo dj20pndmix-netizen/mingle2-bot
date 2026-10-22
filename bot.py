@@ -5,12 +5,15 @@ account syncing, automated like-back, and targeted search & like.
 Resilient against DNS timeouts (ERR_NAME_NOT_RESOLVED), network drops, and ad script delays.
 """
 import os
+import sys
 import json
 import time
 import random
 import re
 import threading
 from typing import Dict, Any, List, Optional
+import requests
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, BrowserContext, Page
 
 import database as db
@@ -188,6 +191,118 @@ def save_raw_session(session_input: Any) -> bool:
         db.log_activity(f"Failed to import session credentials: {e}", level="ERROR")
         return False
 
+def direct_http_login(username_or_email: str, password: str) -> dict:
+    """
+    Direct HTTP authentication with Mingle2 without requiring a browser GUI.
+    Fast (1-2s), extremely lightweight, works anywhere (Docker, Render, VPS, local).
+    """
+    reset_stop()
+    db.log_activity(f"Attempting direct authentication for '{username_or_email}'...", level="INFO")
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Referer': 'https://mingle2.com/user/login',
+        'Origin': 'https://mingle2.com'
+    })
+    
+    try:
+        r = session.get('https://mingle2.com/user/login', timeout=20)
+        if r.status_code != 200:
+            return {"success": False, "error": f"Mingle2 server unreachable (HTTP {r.status_code})"}
+            
+        soup = BeautifulSoup(r.text, 'html.parser')
+        token_elem = soup.find('input', {'name': 'authenticity_token'})
+        token_val = token_elem.get('value') if token_elem else ''
+        
+        payload = {
+            'utf8': '✓',
+            'authenticity_token': token_val,
+            'login': username_or_email,
+            'password': password,
+            'commit': 'LOGIN NOW'
+        }
+        
+        post_res = session.post('https://mingle2.com/user/verify_login', data=payload, timeout=25, allow_redirects=True)
+        cookies = session.cookies.get_dict()
+        
+        # Check authentication indicators
+        has_auth_cookies = 'known_user' in cookies or 'p' in cookies
+        is_authenticated_page = any(w in post_res.text.lower() for w in ['logout', 'my profile', 'log out', 'edit profile'])
+        
+        # Verify by fetching edit_profile if needed
+        if not (has_auth_cookies or is_authenticated_page):
+            try:
+                verify_check = session.get('https://mingle2.com/user/edit_profile', timeout=15)
+                if 'logout' in verify_check.text.lower():
+                    is_authenticated_page = True
+            except Exception:
+                pass
+                
+        if has_auth_cookies or is_authenticated_page:
+            now = time.time()
+            pw_cookies = []
+            for cookie in session.cookies:
+                c_dict = {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain if cookie.domain.startswith('.') else f".{cookie.domain}",
+                    "path": cookie.path,
+                    "expires": cookie.expires if cookie.expires else now + 86400 * 30,
+                    "httpOnly": cookie.name in ['_session_id', 'p'],
+                    "secure": cookie.secure,
+                    "sameSite": "Lax"
+                }
+                pw_cookies.append(c_dict)
+                
+            storage_state = {
+                "cookies": pw_cookies,
+                "origins": [
+                    {
+                        "origin": "https://mingle2.com",
+                        "localStorage": []
+                    }
+                ]
+            }
+            
+            os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(storage_state, f, indent=2)
+                
+            db.log_activity(f"Authentication successful for '{username_or_email}'! Session saved.", level="SUCCESS")
+            # Trigger background sync to get user info, incoming likes, mutual matches
+            threading.Thread(target=sync_account, daemon=True).start()
+            return {"success": True, "message": f"Successfully authenticated as {username_or_email}!"}
+        else:
+            err_msg = "Invalid username/email or password."
+            err_div = soup.find(class_=lambda c: c and 'error' in c.lower())
+            if err_div and err_div.get_text(strip=True):
+                err_msg = err_div.get_text(strip=True)
+            return {"success": False, "error": err_msg}
+    except Exception as e:
+        db.log_activity(f"Direct authentication attempt: {e}", level="WARNING")
+        return {"success": False, "error": str(e)}
+
+def perform_login(username_or_email: str, password: str) -> dict:
+    """
+    Unified high-level login handler.
+    1. Attempts direct HTTP authentication (fast, lightweight, 1-2 seconds).
+    2. If direct HTTP encounters challenge/network issue, falls back to Playwright headless automation.
+    """
+    res = direct_http_login(username_or_email, password)
+    if res.get("success"):
+        return res
+        
+    err_str = res.get("error", "").lower()
+    if "invalid" in err_str or "incorrect" in err_str or "password" in err_str:
+        return res
+        
+    db.log_activity("Falling back to automated headless browser authentication...", level="INFO")
+    pw_ok = headless_login(username_or_email, password)
+    if pw_ok:
+        return {"success": True, "message": f"Successfully authenticated as {username_or_email}!"}
+    return res
+
 def headless_login(username_or_email: str, password: str) -> bool:
     """
     Performs fully automated headless login on cloud environments (like Render).
@@ -196,24 +311,29 @@ def headless_login(username_or_email: str, password: str) -> bool:
     reset_stop()
     db.log_activity(f"Initiating headless login for '{username_or_email}'...", level="INFO")
     with sync_playwright() as p:
-        context = create_context(p, headless=True)
+        browser = p.chromium.launch(headless=True, args=get_stealth_args())
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        setup_context_routes(context)
         page = context.new_page()
         try:
             ok = safe_goto(page, "https://mingle2.com/user/login", timeout=35000, wait_until="commit")
             if not ok:
                 db.log_activity("Could not reach Mingle2 login page.", level="ERROR")
-                context.browser.close()
+                browser.close()
                 return False
 
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(2000)
             dismiss_popups(page)
 
-            user_input = page.query_selector("input[name*='user'], input[name*='email'], input[name*='login'], #username, #email")
-            pass_input = page.query_selector("input[type='password'], input[name*='pass'], #password")
+            user_input = page.query_selector("input#login, input[name='login'], input[name*='user'], input[name*='email'], #username, #email")
+            pass_input = page.query_selector("input#password, input[name='password'], input[type='password'], input[name*='pass'], #password")
 
             if not user_input or not pass_input:
                 db.log_activity("Login input fields not found.", level="ERROR")
-                context.browser.close()
+                browser.close()
                 return False
 
             user_input.fill(username_or_email)
@@ -239,73 +359,90 @@ def headless_login(username_or_email: str, password: str) -> bool:
                 _extract_and_save_my_account(page)
                 _sync_incoming_likes(page)
                 _sync_your_matches(page)
-                context.browser.close()
+                browser.close()
                 return True
             else:
                 db.log_activity("Login failed: Verification check or CAPTCHA encountered. Please use session.json import.", level="WARNING")
-                context.browser.close()
+                browser.close()
                 return False
         except Exception as e:
             db.log_activity(f"Headless login error: {e}", level="ERROR")
-            context.browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
             return False
 
 def interactive_login():
     """
-    Launches a visible (headful) browser window so the user can easily log in,
+    Launches a visible (headful) browser window so the user can easily log in on desktop,
     complete any CAPTCHAs or 2FA, and authenticate. Once logged in, session is saved
     and account is automatically synced.
     """
     reset_stop()
-    db.log_activity("Launching browser for interactive login. Please log in to Mingle2...", level="INFO")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, args=get_stealth_args())
-        context_opts = {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            "viewport": {"width": 1280, "height": 850}
-        }
-        if os.path.exists(SESSION_FILE):
-            try:
-                context = browser.new_context(storage_state=SESSION_FILE, **context_opts)
-            except Exception:
+    # Guard against headless cloud containers (like Render or Docker without X11)
+    if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
+        db.log_activity(
+            "Interactive desktop browser cannot be opened in headless Linux / cloud container. "
+            "Please use the Username/Password form or Session Import in the dashboard.",
+            level="WARNING"
+        )
+        return False
+
+    db.log_activity("Launching desktop browser for interactive login. Please log in to Mingle2...", level="INFO")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False, args=get_stealth_args())
+            context_opts = {
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                "viewport": {"width": 1280, "height": 850}
+            }
+            if os.path.exists(SESSION_FILE):
+                try:
+                    context = browser.new_context(storage_state=SESSION_FILE, **context_opts)
+                except Exception:
+                    context = browser.new_context(**context_opts)
+            else:
                 context = browser.new_context(**context_opts)
-        else:
-            context = browser.new_context(**context_opts)
 
-        setup_context_routes(context)
-        page = context.new_page()
-        safe_goto(page, "https://mingle2.com/user/login", timeout=45000, wait_until="commit")
-        
-        db.log_activity("Browser open. Please log into your Mingle2 account. Waiting for login confirmation...", level="INFO")
-        
-        # Poll until user is logged in
-        max_wait = 180  # 3 minutes
-        start_t = time.time()
-        logged_in = False
-        
-        while time.time() - start_t < max_wait:
-            if is_stopped():
-                break
+            setup_context_routes(context)
+            page = context.new_page()
+            safe_goto(page, "https://mingle2.com/user/login", timeout=45000, wait_until="commit")
             
-            try:
-                current_url = page.url
-                page_text = page.inner_text("body") if page else ""
-                if any(k in page_text.lower() for k in ["log out", "logout", "my profile", "inbox", "mutual match"]) or "/home" in current_url or "/inbox" in current_url:
-                    logged_in = True
+            db.log_activity("Browser open. Please log into your Mingle2 account. Waiting for login confirmation...", level="INFO")
+            
+            # Poll until user is logged in
+            max_wait = 180  # 3 minutes
+            start_t = time.time()
+            logged_in = False
+            
+            while time.time() - start_t < max_wait:
+                if is_stopped():
                     break
-            except Exception:
-                pass
-            
-            time.sleep(2)
+                
+                try:
+                    current_url = page.url
+                    page_text = page.inner_text("body") if page else ""
+                    if any(k in page_text.lower() for k in ["log out", "logout", "my profile", "inbox", "mutual match"]) or "/home" in current_url or "/inbox" in current_url:
+                        logged_in = True
+                        break
+                except Exception:
+                    pass
+                
+                time.sleep(2)
 
-        if logged_in:
-            db.log_activity("Login detected! Saving session and syncing account...", level="SUCCESS")
-            save_session(context)
-            _extract_and_save_my_account(page)
-        else:
-            db.log_activity("Login timed out or window was closed before completing login.", level="WARNING")
+            if logged_in:
+                db.log_activity("Login detected! Saving session and syncing account...", level="SUCCESS")
+                save_session(context)
+                _extract_and_save_my_account(page)
+            else:
+                db.log_activity("Login timed out or window was closed before completing login.", level="WARNING")
 
-        browser.close()
+            browser.close()
+            return logged_in
+    except Exception as e:
+        db.log_activity(f"Interactive login could not launch browser: {e}. Please use in-app credentials or session import.", level="ERROR")
+        return False
 
 def _extract_and_save_my_account(page: Page) -> Optional[Dict[str, Any]]:
     """Extracts our own authenticated account details and ID from Mingle2."""

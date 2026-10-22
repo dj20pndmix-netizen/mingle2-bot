@@ -3,6 +3,7 @@ Mingle2 Bot - Web Control Center & REST API Server
 Asynchronous management dashboard powered by aiohttp.
 """
 import os
+import sys
 import json
 import asyncio
 import threading
@@ -58,15 +59,30 @@ async def api_session_cloud_login(request):
         return web.json_response({"status": "error", "message": f"Task '{get_current_task()}' already running."}, status=400)
     try:
         data = await request.json()
-        email = data.get("username_or_email", "").strip()
+        email = data.get("username_or_email", "").strip() or data.get("email", "").strip() or data.get("username", "").strip()
         pwd = data.get("password", "").strip()
         if not email or not pwd:
             return web.json_response({"status": "error", "message": "Username/Email and Password are required."}, status=400)
         
-        set_current_task("Cloud Headless Login")
-        run_in_background(bot.headless_login, email, pwd)
-        return web.json_response({"status": "started", "message": "Cloud login initiated in background."})
+        set_current_task("Signing In")
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(None, bot.perform_login, email, pwd)
+        set_current_task(None)
+        
+        if res.get("success"):
+            account = db.get_my_account()
+            return web.json_response({
+                "status": "success",
+                "message": res.get("message", "Logged in successfully!"),
+                "account": account
+            })
+        else:
+            return web.json_response({
+                "status": "error",
+                "message": res.get("error", "Authentication failed. Please verify credentials.")
+            }, status=400)
     except Exception as e:
+        set_current_task(None)
         return web.json_response({"status": "error", "message": str(e)}, status=400)
 
 CURRENT_TASK: Optional[str] = None
@@ -162,6 +178,23 @@ async def api_get_profiles(request):
 async def api_trigger_login(request):
     if get_current_task():
         return web.json_response({"status": "error", "message": f"Task '{get_current_task()}' already running."}, status=400)
+    
+    # Check if login credentials were provided in POST body
+    try:
+        if request.can_read_body and request.content_length and request.content_length > 0:
+            data = await request.json()
+            if data and (data.get("username_or_email") or data.get("email") or data.get("username")):
+                return await api_session_cloud_login(request)
+    except Exception:
+        pass
+
+    # For headful browser launch: verify display is available
+    if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
+        return web.json_response({
+            "status": "error",
+            "message": "Desktop browser window cannot be opened on cloud containers or mobile phones. Please use the Sign-In modal to enter your username & password."
+        }, status=400)
+
     set_current_task("Interactive Login")
     run_in_background(bot.interactive_login)
     return web.json_response({"status": "started", "task": "Interactive Login"})
@@ -269,9 +302,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span class="w-2 h-2 rounded-full bg-slate-500 animate-pulse"></span>
           <span>IDLE</span>
         </div>
-        <button onclick="openSessionModal()" class="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 transition">
-          <i class="fa-solid fa-cloud"></i>
-          <span>Session</span>
+        <button onclick="openLoginModal('direct')" class="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 bg-blue-600/25 hover:bg-blue-600/40 text-blue-300 border border-blue-500/30 transition shadow">
+          <i class="fa-solid fa-key"></i>
+          <span>Sign In</span>
+        </button>
+        <button id="header-install-btn" onclick="handlePWAInstallClick()" class="px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 btn-gradient-pink text-white shadow-md hover:scale-105 transition">
+          <i class="fa-solid fa-mobile-screen"></i>
+          <span>Install App</span>
         </button>
         <button onclick="stopBot()" class="px-3 py-1.5 rounded-lg bg-rose-600/20 text-rose-300 hover:bg-rose-600/40 border border-rose-500/30 text-xs font-semibold flex items-center gap-1.5 transition">
           <i class="fa-solid fa-hand"></i> Stop
@@ -295,14 +332,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         </div>
         <div class="mt-4 grid grid-cols-3 gap-1.5 text-center">
-          <button onclick="startLogin()" class="py-1.5 text-[11px] font-medium rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/30 transition truncate" title="Interactive Browser Login">
-            <i class="fa-solid fa-key"></i> Log In
+          <button onclick="openLoginModal('direct')" class="py-1.5 text-[11px] font-medium rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/30 transition truncate" title="Direct Sign-In with Username & Password">
+            <i class="fa-solid fa-key"></i> Sign In
           </button>
           <button onclick="syncAccount()" class="py-1.5 text-[11px] font-medium rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 transition truncate" title="Sync Account ID & Matches">
             <i class="fa-solid fa-arrows-rotate"></i> Sync ID
           </button>
-          <button onclick="openSessionModal()" class="py-1.5 text-[11px] font-medium rounded-lg bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 transition truncate" title="Cloud Session & Backup">
-            <i class="fa-solid fa-cloud"></i> Cloud
+          <button onclick="openLoginModal('import')" class="py-1.5 text-[11px] font-medium rounded-lg bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 transition truncate" title="Session Import & Backup">
+            <i class="fa-solid fa-cloud"></i> Backup
           </button>
         </div>
       </div>
@@ -831,47 +868,186 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Bot Action Triggers
-    async function startLogin() {
-      const res = await fetch("/api/action/login", { method: "POST" });
-      const data = await res.json();
-      if (data.status === "started") alert("Browser opened! Please complete your Mingle2 login in the browser window.");
-      else alert(data.message || "Error");
+    // Smooth Toast Notification System
+    function showToast(message, type = "info") {
+      const container = document.getElementById("toast-container");
+      if (!container) return;
+      const toast = document.createElement("div");
+      toast.className = `px-4 py-2.5 rounded-xl shadow-2xl text-xs font-semibold flex items-center gap-2.5 pointer-events-auto transition-all duration-300 transform translate-y-2 opacity-0 max-w-sm border backdrop-blur-md`;
+      
+      let icon = "fa-circle-info";
+      let colorClasses = "bg-slate-900/95 text-slate-200 border-slate-700 shadow-slate-950/50";
+      if (type === "success") {
+        icon = "fa-circle-check";
+        colorClasses = "bg-emerald-950/95 text-emerald-200 border-emerald-500/50 shadow-emerald-950/50";
+      } else if (type === "error") {
+        icon = "fa-circle-exclamation";
+        colorClasses = "bg-rose-950/95 text-rose-200 border-rose-500/50 shadow-rose-950/50";
+      } else if (type === "warning") {
+        icon = "fa-triangle-exclamation";
+        colorClasses = "bg-amber-950/95 text-amber-200 border-amber-500/50 shadow-amber-950/50";
+      }
+      
+      toast.className += ` ${colorClasses}`;
+      toast.innerHTML = `<i class="fa-solid ${icon} shrink-0 text-sm"></i><span class="flex-1 leading-tight">${message}</span>`;
+      container.appendChild(toast);
+      
+      setTimeout(() => {
+        toast.classList.remove("translate-y-2", "opacity-0");
+      }, 10);
+      
+      setTimeout(() => {
+        toast.classList.add("opacity-0", "translate-x-4");
+        setTimeout(() => toast.remove(), 350);
+      }, 4000);
     }
 
+    // Bot Action Triggers
     async function syncAccount() {
-      const res = await fetch("/api/action/sync", { method: "POST" });
-      const data = await res.json();
-      if (data.status === "started") alert("Account ID synchronization started in background.");
-      else alert(data.message || "Error");
+      showToast("Starting account & match synchronization...", "info");
+      try {
+        const res = await fetch("/api/action/sync", { method: "POST" });
+        const data = await res.json();
+        if (data.status === "started") showToast("Account ID synchronization started in background.", "success");
+        else showToast(data.message || "Error syncing account", "error");
+      } catch (e) {
+        showToast("Network error: " + e.message, "error");
+      }
     }
 
     async function startLikeBack() {
-      const res = await fetch("/api/action/like_back", { method: "POST" });
-      const data = await res.json();
-      if (data.status === "started") alert("Like-Back Routine launched! Monitoring 'Who Liked Me'...");
-      else alert(data.message || "Error");
+      showToast("Launching Like-Back routine...", "info");
+      try {
+        const res = await fetch("/api/action/like_back", { method: "POST" });
+        const data = await res.json();
+        if (data.status === "started") showToast("Like-Back Routine launched! Monitoring incoming likes.", "success");
+        else showToast(data.message || "Error launching Like-Back", "error");
+      } catch (e) {
+        showToast("Network error: " + e.message, "error");
+      }
     }
 
     async function startSearchLike() {
-      const res = await fetch("/api/action/search_like", { method: "POST" });
-      const data = await res.json();
-      if (data.status === "started") alert("Search & Auto-Like Routine launched! Filtering by your target criteria...");
-      else alert(data.message || "Error");
+      showToast("Launching Search & Auto-Like routine...", "info");
+      try {
+        const res = await fetch("/api/action/search_like", { method: "POST" });
+        const data = await res.json();
+        if (data.status === "started") showToast("Search & Auto-Like Routine launched! Filtering by criteria.", "success");
+        else showToast(data.message || "Error launching Search & Like", "error");
+      } catch (e) {
+        showToast("Network error: " + e.message, "error");
+      }
     }
 
     async function stopBot() {
       await fetch("/api/action/stop", { method: "POST" });
-      alert("Stop signal sent to bot.");
+      showToast("Stop signal sent to bot.", "warning");
     }
 
-    // Session Modal Controls
-    function openSessionModal() {
-      document.getElementById('session-modal').classList.remove('hidden');
+    // Unified Authentication Modal Controls
+    function openLoginModal(tab = 'direct') {
+      document.getElementById('login-modal').classList.remove('hidden');
+      switchLoginTab(tab);
     }
 
-    function closeSessionModal() {
-      document.getElementById('session-modal').classList.add('hidden');
+    function closeLoginModal() {
+      document.getElementById('login-modal').classList.add('hidden');
+      const feedback = document.getElementById('login-feedback-box');
+      if (feedback) feedback.classList.add('hidden');
+    }
+
+    function switchLoginTab(tab) {
+      const panelDirect = document.getElementById('panel-direct');
+      const panelImport = document.getElementById('panel-import');
+      const panelBrowser = document.getElementById('panel-browser');
+      const tabDirect = document.getElementById('tab-btn-direct');
+      const tabImport = document.getElementById('tab-btn-import');
+      const tabBrowser = document.getElementById('tab-btn-browser');
+
+      panelDirect.classList.add('hidden');
+      panelImport.classList.add('hidden');
+      panelBrowser.classList.add('hidden');
+
+      tabDirect.className = "py-2 px-3 text-xs font-semibold rounded-lg text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5 flex-1";
+      tabImport.className = "py-2 px-3 text-xs font-semibold rounded-lg text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5 flex-1";
+      tabBrowser.className = "py-2 px-3 text-xs font-semibold rounded-lg text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5 flex-1";
+
+      if (tab === 'direct') {
+        panelDirect.classList.remove('hidden');
+        tabDirect.className = "py-2 px-3 text-xs font-bold rounded-lg bg-blue-600/30 text-blue-200 border border-blue-500/40 shadow transition flex items-center justify-center gap-1.5 flex-1";
+        setTimeout(() => document.getElementById('login-username')?.focus(), 50);
+      } else if (tab === 'import') {
+        panelImport.classList.remove('hidden');
+        tabImport.className = "py-2 px-3 text-xs font-bold rounded-lg bg-purple-600/30 text-purple-200 border border-purple-500/40 shadow transition flex items-center justify-center gap-1.5 flex-1";
+      } else if (tab === 'browser') {
+        panelBrowser.classList.remove('hidden');
+        tabBrowser.className = "py-2 px-3 text-xs font-bold rounded-lg bg-pink-600/30 text-pink-200 border border-pink-500/40 shadow transition flex items-center justify-center gap-1.5 flex-1";
+      }
+    }
+
+    function togglePasswordVisibility() {
+      const passInput = document.getElementById('login-password');
+      const eyeIcon = document.getElementById('eye-icon');
+      if (passInput.type === 'password') {
+        passInput.type = 'text';
+        eyeIcon.classList.replace('fa-eye', 'fa-eye-slash');
+      } else {
+        passInput.type = 'password';
+        eyeIcon.classList.replace('fa-eye-slash', 'fa-eye');
+      }
+    }
+
+    async function submitUnifiedLogin() {
+      const email = document.getElementById('login-username').value.trim();
+      const pwd = document.getElementById('login-password').value.trim();
+      const btn = document.getElementById('login-submit-btn');
+      const feedback = document.getElementById('login-feedback-box');
+
+      if (!email || !pwd) {
+        feedback.className = "p-3 rounded-lg bg-rose-950/80 border border-rose-500/50 text-rose-200 text-xs flex items-center gap-2";
+        feedback.innerHTML = '<i class="fa-solid fa-circle-exclamation shrink-0"></i><span>Please enter both username/email and password.</span>';
+        feedback.classList.remove('hidden');
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Authenticating with Mingle2...';
+      feedback.className = "p-3 rounded-lg bg-blue-950/80 border border-blue-500/50 text-blue-200 text-xs flex items-center gap-2";
+      feedback.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin shrink-0"></i><span>Verifying credentials with Mingle2 server...</span>';
+      feedback.classList.remove('hidden');
+
+      try {
+        const res = await fetch('/api/session/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username_or_email: email, password: pwd })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.status === 'success') {
+          feedback.className = "p-3 rounded-lg bg-emerald-950/80 border border-emerald-500/50 text-emerald-200 text-xs flex items-center gap-2";
+          feedback.innerHTML = '<i class="fa-solid fa-circle-check shrink-0"></i><span>Logged in successfully! Synchronizing account...</span>';
+          showToast("Mingle2 authentication successful!", "success");
+          fetchStatus();
+          setTimeout(() => {
+            closeLoginModal();
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i> Sign In to Mingle2';
+          }, 1200);
+        } else {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i> Sign In to Mingle2';
+          feedback.className = "p-3 rounded-lg bg-rose-950/80 border border-rose-500/50 text-rose-200 text-xs flex items-center gap-2";
+          feedback.innerHTML = `<i class="fa-solid fa-circle-xmark shrink-0"></i><span>${data.message || 'Login failed. Please check credentials or import session.'}</span>`;
+          showToast(data.message || "Login failed", "error");
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i> Sign In to Mingle2';
+        feedback.className = "p-3 rounded-lg bg-rose-950/80 border border-rose-500/50 text-rose-200 text-xs flex items-center gap-2";
+        feedback.innerHTML = `<i class="fa-solid fa-triangle-exclamation shrink-0"></i><span>Network error: ${err.message}</span>`;
+        showToast("Network error during login", "error");
+      }
     }
 
     function handleSessionFileUpload(event) {
@@ -879,15 +1055,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!file) return;
       const reader = new FileReader();
       reader.onload = (e) => {
-        document.getElementById('session-paste-input').value = e.target.result;
+        document.getElementById('modal-session-text').value = e.target.result;
       };
       reader.readAsText(file);
     }
 
-    async function submitImportSession() {
-      const text = document.getElementById('session-paste-input').value.trim();
+    async function submitImportSessionModal() {
+      const text = document.getElementById('modal-session-text').value.trim();
       if (!text) {
-        alert("Please paste session JSON content or select a file.");
+        showToast("Please paste session JSON content or select a file.", "warning");
         return;
       }
       try {
@@ -899,40 +1075,76 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.status === 'success') {
-          alert("Session imported successfully! Your bot is now authenticated on the cloud.");
-          closeSessionModal();
+          showToast("Session imported successfully! Synchronizing account.", "success");
+          closeLoginModal();
           fetchStatus();
         } else {
-          alert("Import error: " + (data.message || "Invalid session data"));
+          showToast("Import error: " + (data.message || "Invalid session data"), "error");
         }
       } catch (e) {
-        alert("JSON parsing error: " + e.message);
+        showToast("JSON parsing error: " + e.message, "error");
       }
     }
 
-    async function submitCloudLogin() {
-      const email = document.getElementById('cloud-login-email').value.trim();
-      const pwd = document.getElementById('cloud-login-password').value.trim();
-      if (!email || !pwd) {
-        alert("Please enter both email/username and password.");
-        return;
-      }
+    async function launchDesktopBrowserModal() {
+      showToast("Requesting desktop browser launch...", "info");
       try {
-        const res = await fetch('/api/session/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username_or_email: email, password: pwd })
-        });
+        const res = await fetch('/api/action/login', { method: 'POST' });
         const data = await res.json();
         if (data.status === 'started') {
-          alert("Headless cloud login started! Watch the Live Activity Stream for progress.");
-          closeSessionModal();
+          showToast("Desktop browser opened. Log in to Mingle2 in the window.", "info");
+          closeLoginModal();
         } else {
-          alert(data.message || "Login failed");
+          showToast(data.message || "Cannot launch desktop browser.", "error");
         }
       } catch (e) {
-        alert("Network error: " + e.message);
+        showToast("Error: " + e.message, "error");
       }
+    }
+
+    // PWA Mobile Installation Handler & Guide Modal
+    let deferredPrompt = null;
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      const banner = document.getElementById('pwa-install-banner');
+      if (banner && !localStorage.getItem('pwa_dismissed')) {
+        banner.classList.remove('hidden');
+      }
+    });
+
+    window.addEventListener('appinstalled', () => {
+      deferredPrompt = null;
+      document.getElementById('pwa-install-banner')?.classList.add('hidden');
+      showToast("Mingle2 Bot successfully installed on your device!", "success");
+    });
+
+    function handlePWAInstallClick() {
+      if (deferredPrompt) {
+        deferredPrompt.prompt();
+        deferredPrompt.userChoice.then((choice) => {
+          if (choice.outcome === 'accepted') {
+            showToast("Installing Mingle2 Bot...", "success");
+          }
+          deferredPrompt = null;
+          document.getElementById('pwa-install-banner')?.classList.add('hidden');
+        });
+      } else {
+        openPWAGuideModal();
+      }
+    }
+
+    function openPWAGuideModal() {
+      document.getElementById('pwa-guide-modal').classList.remove('hidden');
+    }
+
+    function closePWAGuideModal() {
+      document.getElementById('pwa-guide-modal').classList.add('hidden');
+    }
+
+    function dismissInstallBanner() {
+      document.getElementById('pwa-install-banner').classList.add('hidden');
+      localStorage.setItem('pwa_dismissed', 'true');
     }
 
     // PWA Service Worker Registration
@@ -944,35 +1156,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
     }
 
-    // PWA Install Prompt Handler
-    let deferredPrompt = null;
-    window.addEventListener('beforeinstallprompt', (e) => {
-      e.preventDefault();
-      deferredPrompt = e;
-      const banner = document.getElementById('pwa-install-banner');
-      if (banner && !localStorage.getItem('pwa_dismissed')) {
-        banner.classList.remove('hidden');
-      }
-    });
-
     const installBtn = document.getElementById('pwa-install-btn');
     if (installBtn) {
-      installBtn.addEventListener('click', async () => {
-        if (deferredPrompt) {
-          deferredPrompt.prompt();
-          const { outcome } = await deferredPrompt.userChoice;
-          console.log('PWA install outcome:', outcome);
-          deferredPrompt = null;
-          document.getElementById('pwa-install-banner').classList.add('hidden');
-        } else {
-          alert("To install on your phone:\n• Android (Chrome): Tap browser menu (⋮) -> 'Install App' or 'Add to Home Screen'\n• iPhone (Safari): Tap Share button -> 'Add to Home Screen'");
-        }
-      });
-    }
-
-    function dismissInstallBanner() {
-      document.getElementById('pwa-install-banner').classList.add('hidden');
-      localStorage.setItem('pwa_dismissed', 'true');
+      installBtn.addEventListener('click', handlePWAInstallClick);
     }
 
     // Polling Intervals
@@ -987,64 +1173,167 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     setInterval(fetchProfiles, 10000);
   </script>
 
-  <!-- Cloud Session & Backup Modal -->
-  <div id="session-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-    <div class="glass-card max-w-lg w-full p-6 border border-purple-500/40 bg-slate-900/95 space-y-4 shadow-2xl relative">
+  <!-- Unified Sign-In & Authentication Modal -->
+  <div id="login-modal" class="hidden fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-4">
+    <div class="glass-card max-w-lg w-full p-5 sm:p-6 border border-blue-500/40 bg-slate-900/98 space-y-4 shadow-2xl relative">
       <div class="flex items-center justify-between pb-3 border-b border-slate-800">
-        <div class="flex items-center gap-2">
-          <div class="w-8 h-8 rounded-lg bg-purple-500/20 text-purple-400 flex items-center justify-center">
-            <i class="fa-solid fa-cloud-shield"></i>
+        <div class="flex items-center gap-2.5">
+          <div class="w-8 h-8 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center">
+            <i class="fa-solid fa-shield-halved"></i>
           </div>
-          <h3 class="text-base font-bold text-white">Cloud Session & Credentials</h3>
+          <div>
+            <h3 class="text-base font-bold text-white">Mingle2 Authentication</h3>
+            <p class="text-[11px] text-slate-400">Authenticate once to enable automated likes & matches.</p>
+          </div>
         </div>
-        <button onclick="closeSessionModal()" class="text-slate-400 hover:text-white p-1">
+        <button onclick="closeLoginModal()" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition">
           <i class="fa-solid fa-xmark text-lg"></i>
         </button>
       </div>
 
-      <p class="text-xs text-slate-400">
-        Sync, import, or back up your authenticated Mingle2 session on Render.com or mobile devices.
-      </p>
-
-      <!-- Method 1: Export / Download -->
-      <div class="p-3 rounded-lg bg-slate-800/60 border border-slate-700/60 flex items-center justify-between gap-3">
-        <div>
-          <div class="text-xs font-bold text-white">Export Session Backup</div>
-          <p class="text-[11px] text-slate-400">Download current session.json to keep on phone or laptop.</p>
-        </div>
-        <a href="/api/session/export" target="_blank" class="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs font-semibold shrink-0 transition flex items-center gap-1.5">
-          <i class="fa-solid fa-download"></i> Download
-        </a>
-      </div>
-
-      <!-- Method 2: Import Session File or JSON -->
-      <div class="space-y-2">
-        <div class="text-xs font-bold text-white flex items-center justify-between">
-          <span>Import / Paste session.json</span>
-          <label class="text-[11px] text-pink-400 hover:underline cursor-pointer">
-            Upload File <input type="file" id="session-file-input" accept=".json" class="hidden" onchange="handleSessionFileUpload(event)">
-          </label>
-        </div>
-        <textarea id="session-paste-input" rows="3" placeholder='Paste your session.json content here...' class="w-full text-xs font-mono p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 focus:outline-none focus:border-pink-500"></textarea>
-        <button onclick="submitImportSession()" class="w-full py-1.5 rounded-lg btn-gradient-pink text-white text-xs font-bold shadow transition flex items-center justify-center gap-1.5">
-          <i class="fa-solid fa-cloud-arrow-up"></i> Import & Sync Account
+      <!-- Navigation Tabs -->
+      <div class="flex rounded-lg bg-slate-950 p-1 border border-slate-800 gap-1">
+        <button id="tab-btn-direct" onclick="switchLoginTab('direct')" class="py-2 px-3 text-xs font-bold rounded-lg bg-blue-600/30 text-blue-200 border border-blue-500/40 shadow transition flex items-center justify-center gap-1.5 flex-1">
+          <i class="fa-solid fa-key"></i> Direct Sign-In
+        </button>
+        <button id="tab-btn-import" onclick="switchLoginTab('import')" class="py-2 px-3 text-xs font-semibold rounded-lg text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5 flex-1">
+          <i class="fa-solid fa-cloud-arrow-up"></i> Session Import
+        </button>
+        <button id="tab-btn-browser" onclick="switchLoginTab('browser')" class="py-2 px-3 text-xs font-semibold rounded-lg text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5 flex-1">
+          <i class="fa-solid fa-desktop"></i> PC Desktop
         </button>
       </div>
 
-      <!-- Method 3: Cloud Headless Login -->
-      <div class="pt-2 border-t border-slate-800/80 space-y-2">
-        <div class="text-xs font-bold text-white">Direct Headless Cloud Login</div>
-        <p class="text-[11px] text-slate-400">Automates login in cloud containers without opening a browser window.</p>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          <input type="text" id="cloud-login-email" placeholder="Email or Username" class="text-xs p-2 rounded-lg bg-slate-950 border border-slate-800 text-white focus:outline-none focus:border-purple-500">
-          <input type="password" id="cloud-login-password" placeholder="Password" class="text-xs p-2 rounded-lg bg-slate-950 border border-slate-800 text-white focus:outline-none focus:border-purple-500">
+      <!-- Tab 1: Direct Sign-In Panel -->
+      <div id="panel-direct" class="space-y-3.5">
+        <div id="login-feedback-box" class="hidden"></div>
+
+        <div class="space-y-1">
+          <label class="text-xs text-slate-300 font-semibold flex items-center gap-1.5">
+            <i class="fa-solid fa-user text-slate-400"></i> Email or Username
+          </label>
+          <input type="text" id="login-username" placeholder="your_email@example.com or Username" class="w-full text-xs p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-white focus:outline-none focus:border-blue-500">
         </div>
-        <button onclick="submitCloudLogin()" class="w-full py-1.5 rounded-lg bg-purple-600/30 hover:bg-purple-600/50 text-purple-200 border border-purple-500/40 text-xs font-bold transition flex items-center justify-center gap-1.5">
-          <i class="fa-solid fa-right-to-bracket"></i> Authenticate in Cloud
+
+        <div class="space-y-1">
+          <label class="text-xs text-slate-300 font-semibold flex items-center justify-between">
+            <span class="flex items-center gap-1.5"><i class="fa-solid fa-lock text-slate-400"></i> Password</span>
+            <button type="button" onclick="togglePasswordVisibility()" class="text-[11px] text-slate-400 hover:text-blue-400 transition flex items-center gap-1">
+              <i id="eye-icon" class="fa-solid fa-eye"></i> Show
+            </button>
+          </label>
+          <input type="password" id="login-password" placeholder="Your Mingle2 Password" class="w-full text-xs p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-white focus:outline-none focus:border-blue-500">
+        </div>
+
+        <button id="login-submit-btn" onclick="submitUnifiedLogin()" class="w-full py-2.5 rounded-lg btn-gradient-blue text-white text-xs font-bold shadow-lg hover:opacity-95 transition flex items-center justify-center gap-2">
+          <i class="fa-solid fa-right-to-bracket"></i> Sign In to Mingle2
+        </button>
+        <p class="text-[10px] text-slate-500 text-center">Credentials are used locally to create an authenticated session and are never shared.</p>
+      </div>
+
+      <!-- Tab 2: Session Import & Export Panel -->
+      <div id="panel-import" class="hidden space-y-3.5">
+        <div class="space-y-2">
+          <div class="text-xs font-bold text-white flex items-center justify-between">
+            <span>Paste session.json / Cookies</span>
+            <label class="text-[11px] text-pink-400 hover:underline cursor-pointer flex items-center gap-1">
+              <i class="fa-solid fa-file-arrow-up"></i> Choose File 
+              <input type="file" id="modal-session-file" accept=".json" class="hidden" onchange="handleSessionFileUpload(event)">
+            </label>
+          </div>
+          <textarea id="modal-session-text" rows="3" placeholder='Paste your session.json content or cookies here...' class="w-full text-xs font-mono p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 focus:outline-none focus:border-purple-500"></textarea>
+          <button onclick="submitImportSessionModal()" class="w-full py-2 rounded-lg btn-gradient-pink text-white text-xs font-bold shadow transition flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-cloud-arrow-up"></i> Import & Synchronize
+          </button>
+        </div>
+
+        <div class="pt-3 border-t border-slate-800 flex items-center justify-between gap-3">
+          <div>
+            <div class="text-xs font-bold text-white">Export Session Backup</div>
+            <p class="text-[11px] text-slate-400">Download current session for offline backup.</p>
+          </div>
+          <a href="/api/session/export" target="_blank" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold shrink-0 transition flex items-center gap-1.5 border border-slate-700">
+            <i class="fa-solid fa-download"></i> Download
+          </a>
+        </div>
+      </div>
+
+      <!-- Tab 3: Desktop Browser Panel -->
+      <div id="panel-browser" class="hidden space-y-3">
+        <p class="text-xs text-slate-300">
+          Launches a full visible Chrome browser window directly on this PC so you can log into Mingle2 manually and solve any challenges.
+        </p>
+        <div class="p-3 rounded-lg bg-slate-950/70 border border-slate-800 text-[11px] text-slate-400 space-y-1">
+          <div class="font-bold text-slate-200 flex items-center gap-1.5"><i class="fa-solid fa-circle-info text-blue-400"></i> Desktop Mode Only</div>
+          <p>This opens a GUI window on the PC screen. If you are accessing from your mobile phone or cloud containers without a monitor, please use the <b>Direct Sign-In</b> tab.</p>
+        </div>
+        <button onclick="launchDesktopBrowserModal()" class="w-full py-2.5 rounded-lg bg-pink-600/30 hover:bg-pink-600/50 text-pink-200 border border-pink-500/40 text-xs font-bold transition flex items-center justify-center gap-2">
+          <i class="fa-solid fa-arrow-up-right-from-square"></i> Launch Desktop Browser Window
         </button>
       </div>
     </div>
   </div>
+
+  <!-- PWA Install Guide Modal -->
+  <div id="pwa-guide-modal" class="hidden fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-4">
+    <div class="glass-card max-w-md w-full p-5 sm:p-6 border border-pink-500/40 bg-slate-900/98 space-y-4 shadow-2xl relative">
+      <div class="flex items-center justify-between pb-3 border-b border-slate-800">
+        <div class="flex items-center gap-2.5">
+          <img src="/static/icon-192.png" class="w-9 h-9 rounded-xl shadow border border-pink-500/30">
+          <div>
+            <h3 class="text-base font-bold text-white">Install Mingle2 Bot App</h3>
+            <p class="text-[11px] text-pink-300/80">Standalone independent application</p>
+          </div>
+        </div>
+        <button onclick="closePWAGuideModal()" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+      </div>
+
+      <div class="space-y-3 text-xs">
+        <!-- Android Guide -->
+        <div class="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1.5">
+          <div class="font-bold text-emerald-400 flex items-center gap-2">
+            <i class="fa-brands fa-android text-sm"></i> Android Phone (Google Chrome)
+          </div>
+          <ol class="list-decimal list-inside text-slate-300 space-y-1 pl-1 text-[11px]">
+            <li>Tap the <b>three vertical dots</b> (<i class="fa-solid fa-ellipsis-vertical"></i>) in Chrome's top right corner.</li>
+            <li>Tap <b>"Install app"</b> or <b>"Add to Home screen"</b>.</li>
+            <li>Tap <b>Install</b>. The bot appears in your app drawer like any native Android app!</li>
+          </ol>
+        </div>
+
+        <!-- iOS Guide -->
+        <div class="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1.5">
+          <div class="font-bold text-blue-400 flex items-center gap-2">
+            <i class="fa-brands fa-apple text-sm"></i> iPhone / iPad (Safari)
+          </div>
+          <ol class="list-decimal list-inside text-slate-300 space-y-1 pl-1 text-[11px]">
+            <li>Tap the <b>Share button</b> (<i class="fa-solid fa-arrow-up-from-bracket"></i>) at the bottom bar.</li>
+            <li>Scroll down and tap <b>"Add to Home Screen"</b>.</li>
+            <li>Tap <b>Add</b> to place the standalone app on your home screen.</li>
+          </ol>
+        </div>
+
+        <!-- Desktop Guide -->
+        <div class="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1.5">
+          <div class="font-bold text-purple-400 flex items-center gap-2">
+            <i class="fa-solid fa-laptop text-sm"></i> Desktop (Chrome / Edge)
+          </div>
+          <p class="text-slate-300 text-[11px]">
+            Look for the <b>Install App</b> icon (<i class="fa-solid fa-circle-down"></i>) in the right side of your browser URL address bar and click <b>Install</b>.
+          </p>
+        </div>
+      </div>
+
+      <button onclick="closePWAGuideModal()" class="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold transition">
+        Got It!
+      </button>
+    </div>
+  </div>
+
+  <!-- Toast Notification Floating Container -->
+  <div id="toast-container" class="fixed top-4 right-4 z-[9999] flex flex-col gap-2 pointer-events-none"></div>
 </body>
 </html>
 """
