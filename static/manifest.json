@@ -1,0 +1,32 @@
+{
+  "name": "Mingle2 Bot - Match & Automation Center",
+  "short_name": "Mingle2 Bot",
+  "description": "Powerful automation bot for Mingle2. Sync incoming likes, confirmed mutual matches, criteria searches, and auto like-back.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#090d16",
+  "theme_color": "#ec4899",
+  "categories": ["social", "utilities", "lifestyle"],
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icon-maskable.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

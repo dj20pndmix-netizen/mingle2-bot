@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090d16" />
+      <stop offset="50%" stop-color="#111827" />
+      <stop offset="100%" stop-color="#1f1137" />
+    </linearGradient>
+    <linearGradient id="heartGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff2a85" />
+      <stop offset="50%" stop-color="#ec4899" />
+      <stop offset="100%" stop-color="#8b5cf6" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="100" fill="url(#bgGrad)" />
+  <rect width="500" height="500" x="6" y="6" rx="96" fill="none" stroke="#ec4899" stroke-width="6" stroke-opacity="0.4" />
+
+  <path d="M256 430 C130 330 80 260 80 180 C80 110 135 60 205 60 C235 60 250 80 256 95 C262 80 277 60 307 60 C377 60 432 110 432 180 C432 260 382 330 256 430 Z" 
+        fill="url(#heartGrad)" />
+
+  <polygon points="270,140 220,250 265,250 245,350 305,230 260,230" fill="#ffffff" />
+  <circle cx="256" cy="256" r="190" fill="none" stroke="#f472b6" stroke-width="4" stroke-dasharray="16 16" opacity="0.3" />
+</svg>
