@@ -7,9 +7,10 @@ ENV PYTHONUNBUFFERED=1
 ENV HOST=0.0.0.0
 ENV PORT=10000
 
-# Install Python requirements
+# Install Python requirements matching the Playwright base image
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN playwright install chromium
 
 # Copy application files
 COPY . .

@@ -85,9 +85,32 @@ def setup_context_routes(context: BrowserContext):
         except Exception:
             pass
 
+def launch_browser_safe(playwright_instance, headless: bool = True, args: list = None):
+    """
+    Safely launches Chromium with automatic recovery.
+    If the Chromium browser binary is missing (e.g. Docker container after pip update),
+    automatically runs 'playwright install chromium' to fetch the matching binary.
+    """
+    launch_args = args if args is not None else get_stealth_args()
+    try:
+        return playwright_instance.chromium.launch(headless=headless, args=launch_args)
+    except Exception as e:
+        err_msg = str(e)
+        if "Executable doesn't exist" in err_msg or "playwright install" in err_msg:
+            db.log_activity("Playwright browser binary missing. Running automatic install...", level="WARNING")
+            try:
+                import subprocess
+                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+                db.log_activity("Chromium binary installed successfully! Retrying launch...", level="SUCCESS")
+                return playwright_instance.chromium.launch(headless=headless, args=launch_args)
+            except Exception as install_err:
+                db.log_activity(f"Failed to auto-install Playwright chromium: {install_err}", level="ERROR")
+        raise
+
 def create_context(playwright_instance, headless: bool = True) -> BrowserContext:
     """Creates a browser context with stealth parameters, ad-blocking, and saved session state."""
-    browser = playwright_instance.chromium.launch(
+    browser = launch_browser_safe(
+        playwright_instance,
         headless=headless,
         args=get_stealth_args()
     )
@@ -311,7 +334,7 @@ def headless_login(username_or_email: str, password: str) -> bool:
     reset_stop()
     db.log_activity(f"Initiating headless login for '{username_or_email}'...", level="INFO")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=get_stealth_args())
+        browser = launch_browser_safe(p, headless=True, args=get_stealth_args())
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800}
@@ -392,7 +415,7 @@ def interactive_login():
     db.log_activity("Launching desktop browser for interactive login. Please log in to Mingle2...", level="INFO")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False, args=get_stealth_args())
+            browser = launch_browser_safe(p, headless=False, args=get_stealth_args())
             context_opts = {
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
                 "viewport": {"width": 1280, "height": 850}
