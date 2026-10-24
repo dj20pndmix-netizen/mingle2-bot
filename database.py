@@ -137,6 +137,18 @@ def init_db():
     )
     """)
     
+    # Normalize legacy blurred fan rating IDs
+    try:
+        cursor.execute("""
+        UPDATE likes_received
+        SET user_id = 'blurred_fan_' || user_id
+        WHERE (user_id LIKE '10%' OR user_id LIKE '11%')
+          AND user_id NOT LIKE 'blurred_fan_%'
+          AND username LIKE '%.%';
+        """)
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
     
@@ -395,6 +407,11 @@ def get_pending_like_backs(limit: int = 50) -> List[Dict[str, Any]]:
         WHERE (liked_back = 0 OR liked_back IS NULL)
           AND user_id NOT IN (SELECT user_id FROM likes_sent)
           AND user_id NOT IN (SELECT user_id FROM mutual_matches)
+          AND user_id NOT LIKE 'blurred_%'
+          AND user_id NOT LIKE 'fan_%'
+          AND user_id NOT LIKE '10%'
+          AND user_id NOT LIKE '11%'
+          AND LENGTH(user_id) = 8
         ORDER BY received_at DESC
         LIMIT ?
     """, (limit,)).fetchall()

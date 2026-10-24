@@ -911,16 +911,24 @@ def run_like_back(max_likes: int = 30) -> int:
             # 1. Sync live incoming likes & fans
             _sync_incoming_likes(page)
             
+            # Sync verified mutual matches directly from Mingle2
+            _sync_your_matches(page)
+            
             # 2. PHASE 1: Like back actual users who liked our profile from likes_received
             pending_fans = db.get_pending_like_backs(limit=max_likes)
             if pending_fans:
-                db.log_activity(f"Found {len(pending_fans)} pending fans who liked you! Prioritizing Like-Back for guaranteed mutual matches...", level="INFO")
+                db.log_activity(f"Found {len(pending_fans)} pending unblurred fans who liked you! Prioritizing Like-Back for guaranteed mutual matches...", level="INFO")
                 for fan in pending_fans:
                     if is_stopped() or liked_count >= max_likes:
                         break
                     
                     f_uid = str(fan["user_id"]).strip()
                     f_name = fan.get("username") or f"User_{f_uid}"
+                    
+                    # Strictly ensure f_uid is a real Mingle2 user profile ID (8 digits starting with 9)
+                    if not f_uid.isdigit() or len(f_uid) != 8 or f_uid.startswith(("10", "11", "fan_", "blurred_")):
+                        db.mark_liked_back(f_uid)
+                        continue
                     
                     if db.has_already_liked(f_uid):
                         db.mark_liked_back(f_uid)
@@ -986,24 +994,34 @@ def run_like_back(max_likes: int = 30) -> int:
                             m = re.search(r'match/(\d+)', current_url)
                             uid = m.group(1) if m else ""
                             
+                            # Priority 1: Check rate form action /mutual_match/rate/<id> (exact active swipe target)
                             if not uid:
-                                a_link = safe_query_selector(page, "a[href*='/users/view/'], a[href*='/user/view/']")
+                                rate_form = safe_query_selector(page, "form[action*='/mutual_match/rate/']")
+                                if rate_form:
+                                    action = rate_form.get_attribute("action") or ""
+                                    m_form = re.search(r'/rate/(\d+)', action)
+                                    if m_form:
+                                        uid = m_form.group(1)
+
+                            # Priority 2: Check profile link on active card
+                            if not uid:
+                                a_link = safe_query_selector(page, ".match-portrait a[href*='/users/view/'], a[href*='/users/view/'], a[href*='/user/view/']")
                                 if a_link:
                                     href = a_link.get_attribute("href") or ""
-                                    m = re.search(r'view/(\d+)', href)
-                                    if m:
-                                        uid = m.group(1)
+                                    m_link = re.search(r'view/(\d+)', href)
+                                    if m_link:
+                                        uid = m_link.group(1)
 
                             if not uid:
                                 db.log_activity("No more match candidates in current stream.", level="INFO")
                                 break
 
                             username = f"User_{uid}"
-                            title_el = safe_query_selector(page, "a.display-name, .username, h1, .match-portrait")
+                            title_el = safe_query_selector(page, ".match-info h1, .match-info a.display-name, a.display-name, .username, h1, .match-portrait")
                             if title_el:
                                 try:
                                     t = (title_el.inner_text() or "").split(",")[0].strip()
-                                    if t:
+                                    if t and not t.lower().startswith("rate") and not t.lower().startswith("match"):
                                         username = t
                                 except Exception:
                                     pass

@@ -220,7 +220,24 @@ def parse_mutual_match_page(html: str) -> Dict[str, Any]:
         rating_id = item.get("data-rating-id", "").strip()
         rated_at = item.get("data-rated-at", "").strip()
         button_id = item.get("data-button-id", "").strip()
-        uid = rating_id or button_id
+        
+        # Check if an authentic user profile link is present
+        link_el = item.find("a", href=re.compile(r'/(?:users|user)/view/(\d+)'))
+        real_uid = ""
+        if link_el:
+            m = re.search(r'/(?:users|user)/view/(\d+)', link_el.get("href", ""))
+            if m:
+                real_uid = m.group(1)
+        
+        if not real_uid:
+            data_uid = item.get("data-user-id", "").strip() or item.get("data-to-user-id", "").strip()
+            if data_uid and data_uid.isdigit() and len(data_uid) >= 8 and not data_uid.startswith(("10", "11")):
+                real_uid = data_uid
+
+        # Free tier incoming fans are blurred by Mingle2 with only a data-rating-id.
+        # DO NOT treat data-rating-id as user_id to prevent linking to wrong profiles.
+        is_blurred = not bool(real_uid)
+        uid = real_uid if real_uid else f"blurred_fan_{rating_id or button_id}"
 
         if not uid or uid in seen_ids:
             continue
@@ -228,7 +245,7 @@ def parse_mutual_match_page(html: str) -> Dict[str, Any]:
 
         # Name
         name_el = item.find(class_="display-name")
-        username = clean_text(name_el.get_text()) if name_el else f"Fan_{uid}"
+        username = clean_text(name_el.get_text()) if name_el else (f"User_{real_uid}" if real_uid else "Blurred Fan")
 
         # Age & Gender
         gender = ""
@@ -257,6 +274,8 @@ def parse_mutual_match_page(html: str) -> Dict[str, Any]:
 
         users.append({
             "user_id": uid,
+            "real_user_id": real_uid,
+            "is_blurred": is_blurred,
             "rating_id": rating_id,
             "username": username,
             "age": age,

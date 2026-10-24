@@ -832,7 +832,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const username = item.username || `User_${item.user_id}`;
           const isFan = currentTab === "likes_received";
           const isMatch = currentTab === "matches";
-          const profileLink = item.user_id && !isNaN(item.user_id) ? `https://mingle2.com/users/view/${item.user_id}` : `https://mingle2.com/mutual_match/your_matches`;
+          const isBlurredFan = String(item.user_id).startsWith("blurred_") || String(item.user_id).startsWith("fan_") || (item.user_id && String(item.user_id).length === 8 && (String(item.user_id).startsWith("10") || String(item.user_id).startsWith("11")));
+          const profileLink = !isBlurredFan && item.user_id && !isNaN(item.user_id) ? `https://mingle2.com/users/view/${item.user_id}` : `https://mingle2.com/mutual_match/who_is_interested_in_me`;
           
           let demo = "";
           if (item.gender) demo += `${item.gender} • `;
@@ -870,6 +871,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </a>
               </div>
             `;
+          } else if (isFan && isBlurredFan) {
+            actionBtn = `
+              <div class="flex items-center justify-end gap-1.5">
+                <a href="https://mingle2.com/mutual_match/who_is_interested_in_me" target="_blank" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-pink-300 text-xs transition flex items-center gap-1" title="View in Mingle2 Who Liked Me Gallery">
+                  <i class="fa-solid fa-eye mr-1"></i> Who Liked Me
+                </a>
+              </div>
+            `;
           } else if (isFan && !item.liked_back) {
             actionBtn = `
               <button onclick="startLikeBack()" class="px-2.5 py-1 rounded btn-gradient-pink text-white text-xs font-semibold shadow hover:opacity-90 transition">
@@ -884,13 +893,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             `;
           }
 
+          const displayUserId = isBlurredFan ? 
+            `<span class="text-slate-500 text-[11px] font-mono" title="Mingle2 blurred fan - ID masked until unlocked">Blurred Fan</span>` : 
+            `<span class="text-pink-400 font-bold">${item.user_id}</span>`;
+
           return `
             <tr class="hover:bg-slate-900/40 transition">
               <td class="py-3 px-4 flex items-center gap-3">
                 <img src="${photo}" class="w-8 h-8 rounded-full object-cover bg-slate-800 border border-slate-700">
                 <span class="font-medium text-white">${username}</span>
               </td>
-              <td class="py-3 px-4 text-pink-400 font-bold">${item.user_id}</td>
+              <td class="py-3 px-4">${displayUserId}</td>
               <td class="py-3 px-4 text-slate-300 text-xs">${demo}</td>
               <td class="py-3 px-4 text-slate-400 text-xs">${matchInfo}</td>
               <td class="py-3 px-4 text-slate-500 text-xs">${timeStr}</td>
