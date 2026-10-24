@@ -159,7 +159,19 @@ async def api_get_profiles(request):
     elif tab == "likes_received":
         rows = conn.execute("SELECT * FROM likes_received ORDER BY received_at DESC LIMIT ?", (limit,)).fetchall()
     elif tab == "matches":
-        rows = conn.execute("SELECT * FROM mutual_matches ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute("""
+            SELECT mm.id, mm.user_id, mm.username, mm.profile_url, mm.matched_at,
+                   COALESCE(tp.photo_url, lr.photo_url) AS photo_url,
+                   COALESCE(tp.age, lr.age) AS age,
+                   COALESCE(tp.location, lr.location) AS location,
+                   COALESCE(tp.ethnicity, '') AS ethnicity,
+                   COALESCE(tp.body_type, '') AS body_type,
+                   COALESCE(tp.gender, '') AS gender
+            FROM mutual_matches mm
+            LEFT JOIN target_profiles tp ON mm.user_id = tp.user_id
+            LEFT JOIN likes_received lr ON mm.user_id = lr.user_id
+            ORDER BY mm.rowid DESC LIMIT ?
+        """, (limit,)).fetchall()
     else: # all discovered
         rows = conn.execute("SELECT * FROM target_profiles ORDER BY discovered_at DESC LIMIT ?", (limit,)).fetchall()
         
@@ -249,6 +261,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.2/dist/confetti.browser.min.js"></script>
   <style>
     body { background-color: #0b0f19; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
     .glass-card { background: rgba(18, 24, 38, 0.85); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px; }
@@ -649,7 +662,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (data.account && data.account.user_id) {
           document.getElementById("my-username").innerText = data.account.username || "Connected";
           document.getElementById("my-userid").innerText = "ID: " + data.account.user_id;
-          if (data.account.avatar_url) document.getElementById("my-avatar").src = data.account.avatar_url;
+          if (data.account.avatar_url) {
+            document.getElementById("my-avatar").src = data.account.avatar_url;
+            myAccountAvatar = data.account.avatar_url;
+          }
           document.getElementById("session-badge").className = "text-xs text-emerald-400 font-semibold";
           document.getElementById("session-badge").innerText = "● Authenticated";
         } else if (data.session_exists) {
@@ -668,10 +684,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById("stat-mutual-liked").innerText = data.stats.total_confirmed_matches || data.stats.total_mutual_liked || 0;
         document.getElementById("count-sent").innerText = data.stats.total_likes_sent || 0;
         document.getElementById("count-received").innerText = incomingCount;
+        const confirmedMatches = data.stats.total_confirmed_matches || 0;
         if (document.getElementById("count-matches")) {
-          document.getElementById("count-matches").innerText = data.stats.total_confirmed_matches || 0;
+          document.getElementById("count-matches").innerText = confirmedMatches;
         }
         document.getElementById("count-discovered").innerText = data.stats.total_discovered || 0;
+
+        // Auto-trigger celebratory Match Popup on new match detection
+        if (lastConfirmedMatchCount !== null && confirmedMatches > lastConfirmedMatchCount) {
+          checkNewMatchAlert();
+        }
+        lastConfirmedMatchCount = confirmedMatches;
       } catch (e) {
         console.error("Status error:", e);
       }
@@ -793,6 +816,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           return;
         }
 
+        // Auto-show match popup if visiting matches tab with an unnotified match
+        if (currentTab === "matches") {
+          data.items.forEach(item => {
+            if (item.user_id && !seenMatches.has(String(item.user_id))) {
+              seenMatches.add(String(item.user_id));
+              localStorage.setItem('seen_match_ids', JSON.stringify(Array.from(seenMatches)));
+              showMatchModal(item);
+            }
+          });
+        }
+
         tbody.innerHTML = data.items.map(item => {
           const photo = item.photo_url || "https://via.placeholder.com/32";
           const username = item.username || `User_${item.user_id}`;
@@ -825,7 +859,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (isMatch) {
             actionBtn = `
               <div class="flex items-center justify-end gap-1.5">
-                <a href="${profileLink}" target="_blank" class="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-semibold transition">
+                <button onclick="previewMatchModal('${item.user_id}', '${(item.username || '').replace(/'/g, "\\'")}', '${photo}', '${item.age || ''}', '${(item.location || '').replace(/'/g, "\\'")}')" class="px-2 py-1 rounded bg-pink-500/20 hover:bg-pink-500/30 text-pink-300 text-xs font-semibold transition" title="Show 'It\'s A Match!' Celebration Alert">
+                  <i class="fa-solid fa-heart mr-1"></i> Match Alert
+                </button>
+                <a href="https://mingle2.com/inbox/conversation/${item.user_id}" target="_blank" class="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-semibold transition">
                   <i class="fa-solid fa-comments mr-1"></i> Chat
                 </a>
                 <a href="${profileLink}" target="_blank" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition">
@@ -1161,6 +1198,96 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       installBtn.addEventListener('click', handlePWAInstallClick);
     }
 
+    // 'It's A Match!' Celebration Modal Handler
+    let lastConfirmedMatchCount = null;
+    let myAccountAvatar = "https://via.placeholder.com/100";
+    let seenMatches = new Set(JSON.parse(localStorage.getItem('seen_match_ids') || '[]'));
+
+    function fireConfetti() {
+      if (typeof confetti === 'function') {
+        confetti({
+          particleCount: 80,
+          spread: 70,
+          origin: { y: 0.6 }
+        });
+        setTimeout(() => {
+          confetti({
+            particleCount: 60,
+            angle: 60,
+            spread: 60,
+            origin: { x: 0.1, y: 0.7 }
+          });
+          confetti({
+            particleCount: 60,
+            angle: 120,
+            spread: 60,
+            origin: { x: 0.9, y: 0.7 }
+          });
+        }, 250);
+      }
+    }
+
+    async function checkNewMatchAlert() {
+      try {
+        const res = await fetch("/api/profiles?tab=matches&limit=1");
+        const data = await res.json();
+        if (data.items && data.items.length > 0) {
+          const m = data.items[0];
+          if (m.user_id && !seenMatches.has(String(m.user_id))) {
+            seenMatches.add(String(m.user_id));
+            localStorage.setItem('seen_match_ids', JSON.stringify(Array.from(seenMatches)));
+            showMatchModal(m);
+          }
+        }
+      } catch (e) {
+        console.error("Match celebration check error:", e);
+      }
+    }
+
+    function showMatchModal(match) {
+      if (!match) return;
+      const modal = document.getElementById('its-a-match-modal');
+      const usernameEl = document.getElementById('match-modal-username');
+      const chatNameEl = document.getElementById('match-modal-chat-name');
+      const theirAvatarEl = document.getElementById('match-modal-their-avatar');
+      const myAvatarEl = document.getElementById('match-modal-my-avatar');
+      const chatBtn = document.getElementById('match-modal-chat-btn');
+      const viewBtn = document.getElementById('match-modal-view-btn');
+      const detailsEl = document.getElementById('match-modal-details');
+
+      const name = match.username || ('User_' + match.user_id);
+      if (usernameEl) usernameEl.innerText = name;
+      if (chatNameEl) chatNameEl.innerText = name;
+      if (theirAvatarEl) theirAvatarEl.src = match.photo_url || 'https://via.placeholder.com/100';
+      if (myAvatarEl) myAvatarEl.src = myAccountAvatar || 'https://via.placeholder.com/100';
+
+      if (chatBtn) chatBtn.href = `https://mingle2.com/inbox/conversation/${match.user_id}`;
+      if (viewBtn) viewBtn.href = `https://mingle2.com/users/view/${match.user_id}`;
+
+      let demo = [];
+      if (match.age) demo.push(match.age + ' yrs');
+      if (match.gender) demo.push(match.gender);
+      if (match.location) demo.push(match.location);
+      if (detailsEl) detailsEl.innerText = demo.length ? demo.join(' • ') : 'Confirmed mutual match on Mingle2';
+
+      modal.classList.remove('hidden');
+      fireConfetti();
+    }
+
+    function previewMatchModal(userId, username, photoUrl, age, location) {
+      showMatchModal({
+        user_id: userId,
+        username: username,
+        photo_url: photoUrl,
+        age: age,
+        location: location
+      });
+    }
+
+    function closeMatchModal() {
+      document.getElementById('its-a-match-modal').classList.add('hidden');
+    }
+
     // Polling Intervals
     renderCheckboxes();
     fetchConfig();
@@ -1329,6 +1456,73 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button onclick="closePWAGuideModal()" class="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold transition">
         Got It!
       </button>
+    </div>
+  </div>
+
+  <!-- Celebration 'It's A Match!' Modal Popup (matches Mingle2 app notification) -->
+  <div id="its-a-match-modal" class="hidden fixed inset-0 z-[100] bg-black/90 backdrop-blur-md flex items-center justify-center p-3 sm:p-4">
+    <div class="glass-card max-w-md w-full p-6 sm:p-8 border-2 border-pink-500/60 bg-gradient-to-b from-slate-900/98 via-pink-950/40 to-slate-900/98 space-y-6 shadow-2xl relative text-center rounded-2xl overflow-hidden">
+      <!-- Top Close Button -->
+      <button onclick="closeMatchModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-full hover:bg-slate-800 transition">
+        <i class="fa-solid fa-xmark text-xl"></i>
+      </button>
+
+      <!-- Badge & Title -->
+      <div class="space-y-1 pt-2">
+        <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-pink-500/20 text-pink-300 border border-pink-500/30 text-xs font-semibold uppercase tracking-wider mb-2">
+          <i class="fa-solid fa-heart text-pink-500 animate-pulse"></i> Mutual Match
+        </div>
+        <h2 class="text-3xl sm:text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 via-rose-300 to-amber-300 tracking-tight">
+          It's a Match!
+        </h2>
+        <p class="text-xs text-slate-300">
+          You and <span id="match-modal-username" class="text-pink-400 font-bold">Someone</span> have liked each other.
+        </p>
+      </div>
+
+      <!-- Overlapping Avatars with Glowing Heart -->
+      <div class="flex items-center justify-center -space-x-4 py-2 relative">
+        <!-- My Avatar -->
+        <div class="relative z-10">
+          <img id="match-modal-my-avatar" src="https://via.placeholder.com/100" class="w-20 h-20 sm:w-24 sm:h-24 rounded-full object-cover border-4 border-slate-900 shadow-xl bg-slate-800">
+          <span class="absolute bottom-0 right-0 w-6 h-6 rounded-full bg-blue-500 text-white flex items-center justify-center text-[10px] font-bold border-2 border-slate-900">You</span>
+        </div>
+
+        <!-- Center Glowing Heart Badge -->
+        <div class="relative z-30 w-11 h-11 rounded-full bg-gradient-to-tr from-pink-600 to-rose-500 flex items-center justify-center shadow-lg shadow-pink-500/50 border-2 border-white/80 animate-bounce">
+          <i class="fa-solid fa-heart text-white text-lg"></i>
+        </div>
+
+        <!-- Match Avatar -->
+        <div class="relative z-20">
+          <img id="match-modal-their-avatar" src="https://via.placeholder.com/100" class="w-20 h-20 sm:w-24 sm:h-24 rounded-full object-cover border-4 border-slate-900 shadow-xl bg-slate-800">
+          <span class="absolute bottom-0 left-0 w-6 h-6 rounded-full bg-pink-500 text-white flex items-center justify-center text-[10px] font-bold border-2 border-slate-900">
+            <i class="fa-solid fa-heart text-[8px]"></i>
+          </span>
+        </div>
+      </div>
+
+      <!-- Demographic Details & Actions -->
+      <div class="space-y-3 pt-2">
+        <div id="match-modal-details" class="text-xs text-slate-300 bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/80">
+          Confirmed mutual match on Mingle2
+        </div>
+
+        <!-- Say Hi / Chat on Mingle2 Button -->
+        <a id="match-modal-chat-btn" href="#" target="_blank" class="w-full py-3 rounded-xl btn-gradient-pink text-white font-bold flex items-center justify-center gap-2 shadow-lg shadow-pink-500/30 hover:opacity-95 hover:scale-[1.02] transition text-sm">
+          <i class="fa-solid fa-comments"></i> Say Hi to <span id="match-modal-chat-name">Match</span>
+        </a>
+
+        <!-- Open Profile on Mingle2 -->
+        <a id="match-modal-view-btn" href="#" target="_blank" class="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs transition flex items-center justify-center gap-1.5 border border-slate-700">
+          <i class="fa-solid fa-arrow-up-right-from-square"></i> Open Profile on Mingle2
+        </a>
+
+        <!-- Keep Playing / Dismiss -->
+        <button onclick="closeMatchModal()" class="w-full py-2 text-slate-400 hover:text-slate-200 font-medium text-xs transition">
+          Keep Playing & Auto-Liking
+        </button>
+      </div>
     </div>
   </div>
 
