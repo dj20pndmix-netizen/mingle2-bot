@@ -107,6 +107,17 @@ def init_db():
     )
     """)
     
+    # Profile inspections / skips cache to avoid re-inspecting or re-liking same candidates
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS profile_inspections (
+        user_id TEXT PRIMARY KEY,
+        username TEXT,
+        is_match INTEGER DEFAULT 0,
+        mismatch_reason TEXT,
+        inspected_at TEXT
+    )
+    """)
+    
     # Bot Settings & Search Filters
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS bot_config (
@@ -330,10 +341,65 @@ def record_like_sent(user_id: str, username: str, source: str = "search_criteria
     log_activity(f"Liked {username} (ID: {user_id}) via [{source}]", level="LIKE_SENT", user_id=user_id)
 
 def has_already_liked(user_id: str) -> bool:
+    uid = str(user_id).strip()
+    if not uid:
+        return False
     conn = get_connection()
-    row = conn.execute("SELECT id FROM likes_sent WHERE user_id = ?", (user_id,)).fetchone()
+    # Check likes_sent
+    row1 = conn.execute("SELECT id FROM likes_sent WHERE user_id = ?", (uid,)).fetchone()
+    if row1:
+        conn.close()
+        return True
+    # Check confirmed mutual matches
+    row2 = conn.execute("SELECT user_id FROM mutual_matches WHERE user_id = ?", (uid,)).fetchone()
+    if row2:
+        conn.close()
+        return True
+    # Check likes_received where liked_back = 1
+    row3 = conn.execute("SELECT user_id FROM likes_received WHERE user_id = ? AND liked_back = 1", (uid,)).fetchone()
+    conn.close()
+    return row3 is not None
+
+def record_profile_inspected(user_id: str, username: str = "", is_match: bool = False, mismatch_reason: str = ""):
+    uid = str(user_id).strip()
+    if not uid:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    conn.execute("""
+    INSERT INTO profile_inspections (user_id, username, is_match, mismatch_reason, inspected_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        username=CASE WHEN excluded.username != '' THEN excluded.username ELSE profile_inspections.username END,
+        is_match=excluded.is_match,
+        mismatch_reason=excluded.mismatch_reason,
+        inspected_at=excluded.inspected_at
+    """, (uid, username, 1 if is_match else 0, mismatch_reason, now))
+    conn.commit()
+    conn.close()
+
+def has_already_inspected(user_id: str) -> bool:
+    uid = str(user_id).strip()
+    if not uid:
+        return False
+    conn = get_connection()
+    row = conn.execute("SELECT user_id FROM profile_inspections WHERE user_id = ?", (uid,)).fetchone()
     conn.close()
     return row is not None
+
+def get_pending_like_backs(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT user_id, username, photo_url, age, location
+        FROM likes_received
+        WHERE (liked_back = 0 OR liked_back IS NULL)
+          AND user_id NOT IN (SELECT user_id FROM likes_sent)
+          AND user_id NOT IN (SELECT user_id FROM mutual_matches)
+        ORDER BY received_at DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 # Confirmed Mutual Matches
 def record_mutual_match(user_id: str, username: str, photo_url: str = "", age: int = 0, gender: str = "", location: str = "", matched_at: str = "", profile_url: str = ""):
