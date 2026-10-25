@@ -9,6 +9,7 @@ Usage:
   python main.py --sync             # Verifies session and syncs your account User ID
   python main.py --like-back        # Runs Like-Back routine for incoming likes
   python main.py --search-like      # Runs Search & Auto-Like matching target criteria
+  python main.py --welcome          # Runs Auto-Welcome routine for mutual matches
   python main.py --port 8080        # Custom port for web dashboard
 """
 import argparse
@@ -58,6 +59,7 @@ def main():
     parser.add_argument("--sync", action="store_true", help="Sync your account User ID and status")
     parser.add_argument("--like-back", action="store_true", help="Run Like-Back routine on incoming likes")
     parser.add_argument("--search-like", action="store_true", help="Run Search & Auto-Like with criteria filters")
+    parser.add_argument("--welcome", action="store_true", help="Run Auto-Welcome routine to message confirmed mutual matches")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host for dashboard server (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=5000, help="Port for dashboard server (default: 5000)")
     parser.add_argument("--public", "--tunnel", action="store_true", help="Generate instant public HTTPS tunnel for phone access")
@@ -91,6 +93,12 @@ def main():
         print(f"[*] Starting Search & Auto-Like Routine (Limit: {limit})...")
         count = bot.search_and_like(max_likes=limit)
         print(f"[+] Search & Like finished. Total profiles liked: {count}")
+    elif args.welcome:
+        cfg = db.get_config()
+        limit = args.max_likes or cfg.get("max_welcomes_per_session", 20)
+        print(f"[*] Starting Auto-Welcome Routine (Limit: {limit})...")
+        count = bot.run_welcome_routine(max_messages=limit)
+        print(f"[+] Auto-Welcome finished. Total matches welcomed: {count}")
     else:
         # Default: Launch web dashboard (auto-detects Render PORT and HOST)
         env_port = os.environ.get("PORT")

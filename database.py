@@ -126,6 +126,19 @@ def init_db():
     )
     """)
     
+    # Messages / Welcome greetings sent by bot
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS messages_sent (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT UNIQUE,
+        username TEXT,
+        message_body TEXT,
+        message_type TEXT DEFAULT 'welcome',
+        sent_at TEXT,
+        status TEXT DEFAULT 'success'
+    )
+    """)
+
     # Activity logs
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS activity_logs (
@@ -163,7 +176,10 @@ def init_db():
         "max_likes_per_session": "50",
         "min_delay_seconds": "3",
         "max_delay_seconds": "7",
-        "auto_like_back": "true"
+        "auto_like_back": "true",
+        "welcome_message": "Hey! Nice to match with you 😊 How is your day going?",
+        "auto_welcome": "true",
+        "max_welcomes_per_session": "20"
     }
     
     conn = get_connection()
@@ -205,7 +221,7 @@ def get_config() -> Dict[str, Any]:
                 result[key] = int(val)
             except Exception:
                 result[key] = 0
-        elif key in ["require_photo", "auto_like_back"]:
+        elif key in ["require_photo", "auto_like_back", "auto_welcome"]:
             result[key] = str(val).lower() in ["true", "1", "yes"]
         else:
             result[key] = val
@@ -409,9 +425,7 @@ def get_pending_like_backs(limit: int = 50) -> List[Dict[str, Any]]:
           AND user_id NOT IN (SELECT user_id FROM mutual_matches)
           AND user_id NOT LIKE 'blurred_%'
           AND user_id NOT LIKE 'fan_%'
-          AND user_id NOT LIKE '10%'
-          AND user_id NOT LIKE '11%'
-          AND LENGTH(user_id) = 8
+          AND user_id GLOB '[0-9]*'
         ORDER BY received_at DESC
         LIMIT ?
     """, (limit,)).fetchall()
@@ -443,6 +457,50 @@ def get_mutual_matches(limit: int = 50) -> List[Dict[str, Any]]:
     conn.close()
     return [dict(r) for r in rows]
 
+# Welcome Messages
+def record_welcome_sent(user_id: str, username: str, message_body: str, message_type: str = "welcome"):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    conn.execute("""
+    INSERT INTO messages_sent (user_id, username, message_body, message_type, sent_at, status)
+    VALUES (?, ?, ?, ?, ?, 'success')
+    ON CONFLICT(user_id) DO UPDATE SET
+        sent_at=excluded.sent_at,
+        message_body=excluded.message_body
+    """, (user_id, username, message_body, message_type, now))
+    conn.commit()
+    conn.close()
+    log_activity(f"Sent Welcome Message to {username} (ID: {user_id})! 💌", level="MESSAGE_SENT", user_id=user_id)
+
+def has_received_welcome(user_id: str) -> bool:
+    uid = str(user_id).strip()
+    if not uid:
+        return False
+    conn = get_connection()
+    row = conn.execute("SELECT id FROM messages_sent WHERE user_id = ?", (uid,)).fetchone()
+    conn.close()
+    return row is not None
+
+def get_pending_welcomes(limit: int = 20) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT mm.user_id, mm.username, mm.photo_url, mm.age, mm.gender, mm.location, mm.profile_url
+        FROM mutual_matches mm
+        WHERE mm.user_id NOT IN (SELECT user_id FROM messages_sent)
+          AND mm.user_id NOT LIKE 'blurred_%'
+          AND mm.user_id NOT LIKE 'fan_%'
+        ORDER BY mm.rowid DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_messages_sent(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM messages_sent ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
 def get_stats() -> Dict[str, Any]:
     conn = get_connection()
     total_discovered = conn.execute("SELECT COUNT(*) FROM target_profiles").fetchone()[0]
@@ -450,6 +508,7 @@ def get_stats() -> Dict[str, Any]:
     db_likes_received = conn.execute("SELECT COUNT(*) FROM likes_received").fetchone()[0]
     total_mutual_liked = conn.execute("SELECT COUNT(*) FROM likes_sent WHERE source = 'like_back'").fetchone()[0]
     total_confirmed_matches = conn.execute("SELECT COUNT(*) FROM mutual_matches").fetchone()[0]
+    total_welcomes_sent = conn.execute("SELECT COUNT(*) FROM messages_sent").fetchone()[0]
     
     badge = ""
     row = conn.execute("SELECT value FROM bot_config WHERE key = 'incoming_likes_badge'").fetchone()
@@ -463,6 +522,7 @@ def get_stats() -> Dict[str, Any]:
         "total_likes_received": badge if badge else db_likes_received,
         "total_mutual_liked": total_mutual_liked,
         "total_confirmed_matches": total_confirmed_matches,
+        "total_welcomes_sent": total_welcomes_sent,
         "incoming_badge": badge
     }
 

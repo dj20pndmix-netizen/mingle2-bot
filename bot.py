@@ -11,6 +11,7 @@ import time
 import random
 import re
 import threading
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
@@ -376,7 +377,7 @@ def headless_login(username_or_email: str, password: str) -> bool:
             current_url = page.url
             content = page.content()
 
-            if any(k in content.lower() for k in ["logout", "my profile", "account", "inbox", "mutual match"]) or "/home" in current_url:
+            if any(k in content.lower() for k in ["logout", "my profile", "account", "inbox", "mutual match"]) or "/home" in current_url or "/welcome" in current_url:
                 db.log_activity("Headless cloud login successful! Saving session...", level="SUCCESS")
                 save_session(context)
                 _extract_and_save_my_account(page)
@@ -446,7 +447,7 @@ def interactive_login():
                 try:
                     current_url = page.url
                     page_text = page.inner_text("body") if page else ""
-                    if any(k in page_text.lower() for k in ["log out", "logout", "my profile", "inbox", "mutual match"]) or "/home" in current_url or "/inbox" in current_url:
+                    if any(k in page_text.lower() for k in ["log out", "logout", "my profile", "inbox", "mutual match"]) or "/home" in current_url or "/welcome" in current_url or "/inbox" in current_url:
                         logged_in = True
                         break
                 except Exception:
@@ -714,13 +715,20 @@ def check_and_dismiss_match_popup(page: Page, user_id: str = "", username: str =
             user_id=user_id if user_id else None
         )
         if user_id:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             db.record_mutual_match(
                 user_id=user_id,
                 username=username,
                 profile_url=f"https://mingle2.com/users/view/{user_id}",
-                matched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                matched_at=now_str
             )
             db.mark_liked_back(user_id)
+            
+            # Auto-Welcome greeting if enabled
+            cfg = db.get_config()
+            if cfg.get("auto_welcome", True) and not db.has_received_welcome(user_id):
+                w_msg = cfg.get("welcome_message") or "Hey! Nice to match with you 😊"
+                send_welcome_message(page, user_id=user_id, username=username, message_text=w_msg)
 
         # Click the 'X' close button at the top right of the modal
         close_selectors = [
@@ -820,8 +828,8 @@ def _click_like_button(page: Page, user_id: str = "", username: str = "") -> Tup
     # 2. Method A: Official Mingle2 AJAX rate_only execution with CSRF token
     try:
         eval_res = safe_evaluate(page, """(id) => {
-            const csrfMeta = document.querySelector('meta[name="csrf-token"]');
-            const token = csrfMeta ? csrfMeta.content : '';
+            const csrfMeta = document.querySelector('meta[name="csrf-token"], input[name="authenticity_token"]');
+            const token = csrfMeta ? (csrfMeta.content || csrfMeta.value || '') : '';
             return new Promise((resolve) => {
                 if (window.jQuery) {
                     jQuery.ajax({
@@ -862,10 +870,10 @@ def _click_like_button(page: Page, user_id: str = "", username: str = "") -> Tup
             });
         }""", uid)
         
-        if eval_res and eval_res.get("ok"):
+        if eval_res and (eval_res.get("ok") or eval_res.get("success")):
             liked = True
-            data = eval_res.get("data") or {}
-            if data.get("is_mutual") or data.get("mutual_match_connection_id"):
+            data = eval_res.get("data") if eval_res.get("data") is not None else eval_res
+            if isinstance(data, dict) and (data.get("is_mutual") or data.get("mutual_match_connection_id")):
                 is_mutual = True
     except Exception as e:
         db.log_activity(f"AJAX rate_only attempt notice for user {uid}: {e}", level="DEBUG", user_id=uid)
@@ -925,8 +933,8 @@ def run_like_back(max_likes: int = 30) -> int:
                     f_uid = str(fan["user_id"]).strip()
                     f_name = fan.get("username") or f"User_{f_uid}"
                     
-                    # Strictly ensure f_uid is a real Mingle2 user profile ID (8 digits starting with 9)
-                    if not f_uid.isdigit() or len(f_uid) != 8 or f_uid.startswith(("10", "11", "fan_", "blurred_")):
+                    # Ensure f_uid is a real numeric Mingle2 user ID
+                    if not f_uid.isdigit() or f_uid.startswith(("fan_", "blurred_")):
                         db.mark_liked_back(f_uid)
                         continue
                     
@@ -1045,36 +1053,8 @@ def run_like_back(max_likes: int = 30) -> int:
 
                             db.log_activity(f"Executing Mutual Match LIKE for {username} (ID: {uid})...", level="INFO", user_id=uid)
                             
-                            liked = False
-                            is_mutual = False
-                            
-                            like_btn = safe_query_selector(page, "button[data-recaptcha-action='like'], .rate-yes-btn")
-                            if like_btn and like_btn.is_visible():
-                                try:
-                                    like_btn.click(force=True, timeout=4000)
-                                    liked = True
-                                except Exception:
-                                    pass
-
-                            if not liked:
-                                res = safe_evaluate(page, """() => {
-                                    const btn = document.querySelector('button[data-recaptcha-action="like"], .rate-yes-btn');
-                                    if (btn) { btn.click(); return true; }
-                                    const form = document.querySelector('form[action*="/mutual_match/rate/"] input[name="rating"][value="Y"]');
-                                    if (form && form.form) { form.form.submit(); return true; }
-                                    return false;
-                                }""")
-                                if res:
-                                    liked = True
-
-                            try:
-                                page.wait_for_load_state("domcontentloaded", timeout=6000)
-                            except Exception:
-                                page.wait_for_timeout(2000)
-
-                            popup_matched = check_and_dismiss_match_popup(page, user_id=uid, username=username)
-                            if popup_matched:
-                                is_mutual = True
+                            # Execute verified like with AJAX rate_only + button click
+                            liked, is_mutual = _click_like_button(page, user_id=uid, username=username)
 
                             if liked:
                                 db.record_like_sent(
@@ -1092,6 +1072,10 @@ def run_like_back(max_likes: int = 30) -> int:
                                         username=username,
                                         profile_url=f"https://mingle2.com/users/view/{uid}"
                                     )
+                                    cfg = db.get_config()
+                                    if cfg.get("auto_welcome", True) and not db.has_received_welcome(uid):
+                                        w_msg = cfg.get("welcome_message") or "Hey! Nice to match with you 😊"
+                                        send_welcome_message(page, user_id=uid, username=username, message_text=w_msg)
 
                             human_delay(1.5, 3.0)
 
@@ -1159,31 +1143,38 @@ def search_and_like(max_likes: int = 30) -> int:
             discovered_users: List[Dict[str, Any]] = []
             seen_uids = set()
 
-            # Paginate through search pages to discover fresh, uninspected candidates
-            max_pages = 5
-            for page_num in range(1, max_pages + 1):
-                if is_stopped() or len(discovered_users) >= max_likes * 4:
+            # Candidate discovery streams: online singles, browse categories, and target search
+            discovery_urls = [
+                ("Online Singles", "https://mingle2.com/online_users"),
+                ("Browse Singles", "https://mingle2.com/browse"),
+                ("Target Search", "https://mingle2.com/search")
+            ]
+            
+            for stream_name, base_url in discovery_urls:
+                if is_stopped() or len(discovered_users) >= max_likes * 3:
                     break
-                
-                search_url = f"https://mingle2.com/search?page={page_num}" if page_num > 1 else "https://mingle2.com/search"
-                db.log_activity(f"Scanning target profiles on search results: Page {page_num}", level="INFO")
-                
-                if safe_goto(page, search_url, timeout=25000, wait_until="commit"):
-                    content = page.content()
-                    found = scraper.parse_search_results(content)
+                for page_num in range(1, 4):
+                    if is_stopped() or len(discovered_users) >= max_likes * 3:
+                        break
                     
-                    new_on_page = 0
-                    for u in found:
-                        uid = str(u.get("user_id", "")).strip()
-                        if uid and uid not in seen_uids:
-                            seen_uids.add(uid)
-                            # Pre-filter: only queue if NOT already liked and NOT already inspected
-                            if not db.has_already_liked(uid) and not db.has_already_inspected(uid):
-                                discovered_users.append(u)
-                                new_on_page += 1
-                                
-                    db.log_activity(f"Page {page_num}: Found {len(found)} candidate cards ({new_on_page} fresh candidates)", level="INFO")
-                    human_delay(1.5, 2.5)
+                    stream_url = f"{base_url}?page={page_num}" if page_num > 1 else base_url
+                    db.log_activity(f"Scanning candidates on [{stream_name}] Page {page_num}...", level="INFO")
+                    
+                    if safe_goto(page, stream_url, timeout=20000, wait_until="commit"):
+                        content = page.content()
+                        found = scraper.parse_search_results(content)
+                        
+                        new_found = 0
+                        for u in found:
+                            uid = str(u.get("user_id", "")).strip()
+                            if uid and uid not in seen_uids:
+                                seen_uids.add(uid)
+                                if not db.has_already_liked(uid) and not db.has_already_inspected(uid):
+                                    discovered_users.append(u)
+                                    new_found += 1
+                                    
+                        db.log_activity(f"{stream_name} (Page {page_num}): Found {len(found)} candidate cards ({new_found} fresh)", level="INFO")
+                        human_delay(1.0, 2.0)
 
             db.log_activity(f"Total fresh unique candidates to inspect: {len(discovered_users)}", level="INFO")
 
@@ -1288,6 +1279,131 @@ def search_and_like(max_likes: int = 30) -> int:
 
     db.log_activity(f"Search & Like routine completed. Liked {liked_count} profiles out of {inspected_count} inspected.", level="SUCCESS")
     return liked_count
+
+
+def send_welcome_message(page: Page, user_id: str, username: str = "", message_text: str = "") -> bool:
+    """
+    Sends a personalized welcome / icebreaker message to a confirmed mutual match
+    via https://mingle2.com/inbox/conversation/{user_id}.
+    Prevents duplicate messages and logs delivery in messages_sent database table.
+    """
+    uid = str(user_id).strip()
+    if not uid:
+        return False
+        
+    name = username or f"User_{uid}"
+    
+    if db.has_received_welcome(uid):
+        db.log_activity(f"Skipping welcome message to {name} (ID: {uid}) - Already sent previously.", level="DEBUG", user_id=uid)
+        return False
+        
+    cfg = db.get_config()
+    msg_body = message_text or cfg.get("welcome_message") or "Hey! Nice to match with you 😊 How is your day going?"
+    
+    db.log_activity(f"Preparing to send Welcome Message to {name} (ID: {uid})...", level="INFO", user_id=uid)
+    
+    try:
+        conv_url = f"https://mingle2.com/inbox/conversation/{uid}"
+        ok = safe_goto(page, conv_url, timeout=25000, wait_until="commit")
+        if not ok:
+            return False
+            
+        page.wait_for_timeout(1500)
+        dismiss_popups(page)
+        
+        # Verify if conversation already has sent messages from us
+        already_has_msg = safe_evaluate(page, """() => {
+            const msgs = document.querySelectorAll('.message-item, .chat-message, .convo-item');
+            return msgs.length > 0;
+        }""")
+        
+        # Locate message textarea
+        textarea = safe_query_selector(page, "textarea#message_body, textarea[name='message[body]'], #message_body, textarea")
+        if not textarea:
+            # Fallback check on /inbox/new/{uid}
+            safe_goto(page, f"https://mingle2.com/inbox/new/{uid}", timeout=20000, wait_until="commit")
+            page.wait_for_timeout(1500)
+            dismiss_popups(page)
+            textarea = safe_query_selector(page, "textarea#message_body, textarea[name='message[body]'], #message_body, textarea")
+            
+        if not textarea:
+            db.log_activity(f"Could not locate message input box for {name} (ID: {uid}).", level="WARNING", user_id=uid)
+            return False
+            
+        # Type message human-like
+        textarea.fill(msg_body)
+        human_delay(0.8, 1.5)
+        
+        # Click submit button
+        submit_btn = safe_query_selector(page, "input[type='submit'][name='commit'], .orange-btn, input[type='submit'], button[type='submit']")
+        if submit_btn and submit_btn.is_visible():
+            submit_btn.click(force=True, timeout=4000)
+        else:
+            textarea.press("Enter")
+            
+        page.wait_for_timeout(2500)
+        
+        # Record sent welcome message
+        db.record_welcome_sent(user_id=uid, username=name, message_body=msg_body)
+        db.log_activity(f"Successfully delivered Welcome Message to {name} (ID: {uid})! 💌", level="SUCCESS", user_id=uid)
+        return True
+    except Exception as e:
+        db.log_activity(f"Failed to send welcome message to user {uid}: {e}", level="WARNING", user_id=uid)
+        return False
+
+def run_welcome_routine(max_messages: int = 20) -> int:
+    """
+    Iterates through confirmed mutual matches and sends personalized
+    welcome / icebreaker greetings to every new match who hasn't been messaged yet.
+    """
+    reset_stop()
+    if not os.path.exists(SESSION_FILE):
+        db.log_activity("No saved session found. Please log in first.", level="WARNING")
+        return 0
+
+    cfg = db.get_config()
+    limit = max_messages or cfg.get("max_welcomes_per_session", 20)
+    db.log_activity(f"Starting 'Auto-Welcome Matches' routine (Limit: {limit} messages)...", level="INFO")
+    
+    welcomed_count = 0
+    with sync_playwright() as p:
+        context = create_context(p, headless=True)
+        page = context.new_page()
+        try:
+            # Sync fresh mutual matches first
+            _sync_your_matches(page)
+            
+            pending_matches = db.get_pending_welcomes(limit=limit)
+            if not pending_matches:
+                db.log_activity("All confirmed mutual matches have already received welcome greetings! Nothing pending.", level="SUCCESS")
+                context.browser.close()
+                return 0
+                
+            db.log_activity(f"Found {len(pending_matches)} confirmed mutual matches waiting for welcome greetings! Starting messaging...", level="INFO")
+            
+            w_msg = cfg.get("welcome_message") or "Hey! Nice to match with you 😊 How is your day going?"
+            
+            for match in pending_matches:
+                if is_stopped() or welcomed_count >= limit:
+                    break
+                    
+                uid = str(match["user_id"]).strip()
+                name = match.get("username") or f"User_{uid}"
+                
+                success = send_welcome_message(page, user_id=uid, username=name, message_text=w_msg)
+                if success:
+                    welcomed_count += 1
+                    
+                human_delay(2.5, 5.0)
+                
+            save_session(context)
+        except Exception as e:
+            db.log_activity(f"Error during Auto-Welcome routine: {e}", level="ERROR")
+        finally:
+            context.browser.close()
+            
+    db.log_activity(f"Auto-Welcome routine finished! Sent {welcomed_count} welcome greetings to matches.", level="SUCCESS")
+    return welcomed_count
 
 if __name__ == "__main__":
     db.init_db()

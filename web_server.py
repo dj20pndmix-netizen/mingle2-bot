@@ -172,6 +172,18 @@ async def api_get_profiles(request):
             LEFT JOIN likes_received lr ON mm.user_id = lr.user_id
             ORDER BY mm.rowid DESC LIMIT ?
         """, (limit,)).fetchall()
+    elif tab == "messages":
+        rows = conn.execute("""
+            SELECT ms.id, ms.user_id, ms.username, ms.message_body, ms.message_type, ms.sent_at, ms.status,
+                   COALESCE(tp.photo_url, lr.photo_url, mm.photo_url) AS photo_url,
+                   COALESCE(tp.age, lr.age, mm.age) AS age,
+                   COALESCE(tp.location, lr.location, mm.location) AS location
+            FROM messages_sent ms
+            LEFT JOIN target_profiles tp ON ms.user_id = tp.user_id
+            LEFT JOIN likes_received lr ON ms.user_id = lr.user_id
+            LEFT JOIN mutual_matches mm ON ms.user_id = mm.user_id
+            ORDER BY ms.id DESC LIMIT ?
+        """, (limit,)).fetchall()
     else: # all discovered
         rows = conn.execute("SELECT * FROM target_profiles ORDER BY discovered_at DESC LIMIT ?", (limit,)).fetchall()
         
@@ -235,6 +247,15 @@ async def api_trigger_search_like(request):
     set_current_task("Search & Auto-Like")
     run_in_background(bot.search_and_like, max_likes)
     return web.json_response({"status": "started", "task": "Search & Auto-Like"})
+
+async def api_trigger_welcome(request):
+    if get_current_task():
+        return web.json_response({"status": "error", "message": f"Task '{get_current_task()}' already running."}, status=400)
+    cfg = db.get_config()
+    max_welcomes = cfg.get("max_welcomes_per_session", 20)
+    set_current_task("Auto-Welcome Matches")
+    run_in_background(bot.run_welcome_routine, max_welcomes)
+    return web.json_response({"status": "started", "task": "Auto-Welcome Matches"})
 
 async def api_trigger_stop(request):
     bot.request_stop()
@@ -424,25 +445,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <h2 class="text-lg font-bold text-white mb-4 flex items-center gap-2">
             <i class="fa-solid fa-bolt text-yellow-400"></i> 1-Click Bot Automation Engines
           </h2>
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
             
             <button onclick="startLikeBack()" class="btn-gradient-pink glow-pink p-4 rounded-xl text-left font-semibold text-white transition flex flex-col justify-between shadow-lg">
               <div class="flex items-center justify-between">
-                <span class="text-base"><i class="fa-solid fa-heart-circle-check mr-2"></i> Auto Like-Back</span>
+                <span class="text-sm sm:text-base"><i class="fa-solid fa-heart-circle-check mr-2"></i> Auto Like-Back</span>
                 <i class="fa-solid fa-arrow-right opacity-80"></i>
               </div>
-              <p class="text-xs font-normal text-pink-100 mt-2 opacity-90">
-                Scrapes "Who Is Interested In Me", extracts their exact User IDs, and likes them back instantly.
+              <p class="text-[11px] font-normal text-pink-100 mt-2 opacity-90">
+                Likes back waiting fans & explores mutual match candidate stream with verified rating.
               </p>
             </button>
 
             <button onclick="startSearchLike()" class="btn-gradient-blue glow-blue p-4 rounded-xl text-left font-semibold text-white transition flex flex-col justify-between shadow-lg">
               <div class="flex items-center justify-between">
-                <span class="text-base"><i class="fa-solid fa-crosshairs mr-2"></i> Search & Auto-Like</span>
+                <span class="text-sm sm:text-base"><i class="fa-solid fa-crosshairs mr-2"></i> Search & Auto-Like</span>
                 <i class="fa-solid fa-arrow-right opacity-80"></i>
               </div>
-              <p class="text-xs font-normal text-blue-100 mt-2 opacity-90">
-                Scans Mingle2 targets, screens age, skin colour/ethnicity, body size, and likes exact matches.
+              <p class="text-[11px] font-normal text-blue-100 mt-2 opacity-90">
+                Discovers active singles online, evaluates age, ethnicity & body criteria, and auto-likes matches.
+              </p>
+            </button>
+
+            <button onclick="startWelcome()" class="btn-gradient-emerald glow-emerald p-4 rounded-xl text-left font-semibold text-white transition flex flex-col justify-between shadow-lg">
+              <div class="flex items-center justify-between">
+                <span class="text-sm sm:text-base"><i class="fa-solid fa-paper-plane mr-2"></i> Auto-Welcome</span>
+                <i class="fa-solid fa-arrow-right opacity-80"></i>
+              </div>
+              <p class="text-[11px] font-normal text-emerald-100 mt-2 opacity-90">
+                Sends personalized welcome icebreaker messages to confirmed mutual matches so conversations start!
               </p>
             </button>
 
@@ -530,6 +561,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               </div>
             </div>
 
+            <!-- Welcome Message / Icebreaker Settings -->
+            <div class="pt-4 border-t border-slate-800 space-y-2.5">
+              <div class="flex items-center justify-between">
+                <label class="block text-xs font-bold text-emerald-400">
+                  <i class="fa-solid fa-envelope-open-text mr-1"></i> Auto-Welcome Message (Icebreaker Greeting)
+                </label>
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" id="auto_welcome" class="w-4 h-4 rounded text-emerald-600 bg-slate-900 border-slate-700 focus:ring-0">
+                  <span class="text-xs text-slate-300 font-semibold">Enable Auto-Welcome</span>
+                </label>
+              </div>
+              <textarea id="welcome_message" rows="2" placeholder="Hey! Nice to match with you 😊 How is your day going?" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs sm:text-sm text-white focus:outline-none focus:border-emerald-500"></textarea>
+              <p class="text-[11px] text-slate-400">Sent to confirmed mutual matches to greet them and break the ice automatically.</p>
+            </div>
+
           </form>
         </div>
 
@@ -572,6 +618,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </button>
           <button onclick="switchTab('matches')" id="tab-btn-matches" class="px-3 py-1.5 rounded-md text-amber-400 hover:text-amber-300 transition">
             🔥 Confirmed Matches (<span id="count-matches">0</span>)
+          </button>
+          <button onclick="switchTab('messages')" id="tab-btn-messages" class="px-3 py-1.5 rounded-md text-emerald-400 hover:text-emerald-300 transition">
+            💌 Welcomes Sent (<span id="count-messages">0</span>)
           </button>
           <button onclick="switchTab('all_discovered')" id="tab-btn-all_discovered" class="px-3 py-1.5 rounded-md text-slate-400 hover:text-white transition">
             All Discovered (<span id="count-discovered">0</span>)
@@ -688,6 +737,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (document.getElementById("count-matches")) {
           document.getElementById("count-matches").innerText = confirmedMatches;
         }
+        if (document.getElementById("count-messages")) {
+          document.getElementById("count-messages").innerText = data.stats.total_welcomes_sent || 0;
+        }
         document.getElementById("count-discovered").innerText = data.stats.total_discovered || 0;
 
         // Auto-trigger celebratory Match Popup on new match detection
@@ -712,6 +764,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById("min_delay_seconds").value = cfg.min_delay_seconds || 3;
         document.getElementById("max_delay_seconds").value = cfg.max_delay_seconds || 7;
         document.getElementById("require_photo").checked = !!cfg.require_photo;
+        if (document.getElementById("welcome_message")) {
+          document.getElementById("welcome_message").value = cfg.welcome_message || "Hey! Nice to match with you 😊 How is your day going?";
+        }
+        if (document.getElementById("auto_welcome")) {
+          document.getElementById("auto_welcome").checked = cfg.auto_welcome !== false;
+        }
 
         const targetEth = cfg.target_ethnicities || [];
         document.querySelectorAll("input[name='target_ethnicities']").forEach(cb => {
@@ -740,7 +798,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         max_likes_per_session: parseInt(document.getElementById("max_likes_per_session").value) || 25,
         min_delay_seconds: parseInt(document.getElementById("min_delay_seconds").value) || 3,
         max_delay_seconds: parseInt(document.getElementById("max_delay_seconds").value) || 7,
-        require_photo: document.getElementById("require_photo").checked
+        require_photo: document.getElementById("require_photo").checked,
+        welcome_message: document.getElementById("welcome_message") ? document.getElementById("welcome_message").value : "",
+        auto_welcome: document.getElementById("auto_welcome") ? document.getElementById("auto_welcome").checked : true
       };
 
       try {
@@ -792,7 +852,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function switchTab(tab) {
       currentTab = tab;
-      ["likes_sent", "likes_received", "matches", "all_discovered"].forEach(t => {
+      ["likes_sent", "likes_received", "matches", "messages", "all_discovered"].forEach(t => {
         const btn = document.getElementById("tab-btn-" + t);
         if (btn) {
           if (t === tab) {
@@ -832,6 +892,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const username = item.username || `User_${item.user_id}`;
           const isFan = currentTab === "likes_received";
           const isMatch = currentTab === "matches";
+          const isMessage = currentTab === "messages";
           const isBlurredFan = String(item.user_id).startsWith("blurred_") || String(item.user_id).startsWith("fan_") || (item.user_id && String(item.user_id).length === 8 && (String(item.user_id).startsWith("10") || String(item.user_id).startsWith("11")));
           const profileLink = !isBlurredFan && item.user_id && !isNaN(item.user_id) ? `https://mingle2.com/users/view/${item.user_id}` : `https://mingle2.com/mutual_match/who_is_interested_in_me`;
           
@@ -843,8 +904,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (item.location) demo += `${item.location}`;
           if (!demo) demo = "Demographics saved in profile";
 
-          let matchInfo = item.source || (isFan ? "Incoming Fan" : (isMatch ? "Confirmed Match" : "Discovered"));
-          if (isMatch) {
+          let matchInfo = item.source || (isFan ? "Incoming Fan" : (isMatch ? "Confirmed Match" : (isMessage ? "Welcome Delivered" : "Discovered")));
+          if (isMessage) {
+            matchInfo = '<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold text-[10px]">💌 ' + (item.message_body ? item.message_body.substring(0, 35) + '...' : 'Welcome Sent') + '</span>';
+          } else if (isMatch) {
             matchInfo = '<span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold text-[10px]">🔥 Confirmed Match</span>';
           } else if (isFan) {
             matchInfo = item.liked_back ? 
@@ -855,6 +918,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
 
           let timeStr = item.matched_at || item.sent_at || item.received_at || item.discovered_at || "Recent";
+          if (isMessage) {
+            actionBtn = `
+              <div class="flex items-center justify-end gap-1.5">
+                <a href="https://mingle2.com/inbox/conversation/${item.user_id}" target="_blank" class="px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 text-xs font-semibold transition flex items-center gap-1">
+                  <i class="fa-solid fa-comments"></i> View Chat
+                </a>
+              </div>
+            `;
+          }
           
           let actionBtn = "";
           if (isMatch) {
@@ -984,6 +1056,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         if (data.status === "started") showToast("Search & Auto-Like Routine launched! Filtering by criteria.", "success");
         else showToast(data.message || "Error launching Search & Like", "error");
+      } catch (e) {
+        showToast("Network error: " + e.message, "error");
+      }
+    }
+
+    async function startWelcome() {
+      showToast("Launching Auto-Welcome routine...", "info");
+      try {
+        const res = await fetch("/api/action/welcome", { method: "POST" });
+        const data = await res.json();
+        if (data.status === "started") showToast("Auto-Welcome Routine launched! Greeting confirmed matches.", "success");
+        else showToast(data.message || "Error launching Auto-Welcome", "error");
       } catch (e) {
         showToast("Network error: " + e.message, "error");
       }
@@ -1570,6 +1654,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/action/sync", api_trigger_sync)
     app.router.add_post("/api/action/like_back", api_trigger_like_back)
     app.router.add_post("/api/action/search_like", api_trigger_search_like)
+    app.router.add_post("/api/action/welcome", api_trigger_welcome)
     app.router.add_post("/api/action/stop", api_trigger_stop)
     return app
 

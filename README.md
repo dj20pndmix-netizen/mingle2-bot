@@ -90,6 +90,13 @@ You can trigger tasks directly from the dashboard with 1 click, or via CLI:
   python main.py --search-like
   ```
 
+#### Auto-Welcome (Message Mutual Matches)
+* **Dashboard**: Click **`Auto-Welcome`**
+* **CLI**:
+  ```bash
+  python main.py --welcome
+  ```
+
 #### Sync Account
 * **Dashboard**: Click **`Sync ID`**
 * **CLI**:
