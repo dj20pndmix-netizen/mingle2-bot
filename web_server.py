@@ -708,7 +708,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         // Account info
-        if (data.account && data.account.user_id) {
+        if (data.account && data.account.user_id && data.account.is_logged_in !== 0) {
           document.getElementById("my-username").innerText = data.account.username || "Connected";
           document.getElementById("my-userid").innerText = "ID: " + data.account.user_id;
           if (data.account.avatar_url) {
@@ -717,6 +717,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
           document.getElementById("session-badge").className = "text-xs text-emerald-400 font-semibold";
           document.getElementById("session-badge").innerText = "● Authenticated";
+          document.getElementById("session-badge").onclick = null;
+        } else if (data.account && data.account.is_logged_in === 0) {
+          document.getElementById("session-badge").className = "text-xs text-rose-400 font-semibold cursor-pointer animate-pulse";
+          document.getElementById("session-badge").innerText = "⚠ Session Expired (Sign In)";
+          document.getElementById("session-badge").onclick = () => openLoginModal('direct');
         } else if (data.session_exists) {
           document.getElementById("session-badge").className = "text-xs text-blue-400 font-semibold";
           document.getElementById("session-badge").innerText = "Session Saved (Syncing...)";
@@ -943,19 +948,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </a>
               </div>
             `;
-          } else if (isFan && isBlurredFan) {
+          } else if (isFan && !item.liked_back) {
             actionBtn = `
               <div class="flex items-center justify-end gap-1.5">
-                <a href="https://mingle2.com/mutual_match/who_is_interested_in_me" target="_blank" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-pink-300 text-xs transition flex items-center gap-1" title="View in Mingle2 Who Liked Me Gallery">
-                  <i class="fa-solid fa-eye mr-1"></i> Who Liked Me
+                <button onclick="startLikeBack()" class="px-2.5 py-1 rounded btn-gradient-pink text-white text-xs font-semibold shadow hover:opacity-90 transition flex items-center gap-1" title="Reciprocate like in Mutual Match stream">
+                  <i class="fa-solid fa-heart mr-1"></i> Like Back
+                </button>
+                <a href="https://mingle2.com/mutual_match/who_is_interested_in_me" target="_blank" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition" title="View Gallery on Mingle2">
+                  <i class="fa-solid fa-arrow-up-right-from-square"></i>
                 </a>
               </div>
             `;
-          } else if (isFan && !item.liked_back) {
+          } else if (isFan && item.liked_back) {
             actionBtn = `
-              <button onclick="startLikeBack()" class="px-2.5 py-1 rounded btn-gradient-pink text-white text-xs font-semibold shadow hover:opacity-90 transition">
-                <i class="fa-solid fa-heart mr-1"></i> Like Back
-              </button>
+              <div class="flex items-center justify-end gap-1.5">
+                <span class="px-2 py-1 rounded bg-emerald-500/20 text-emerald-300 text-xs font-semibold flex items-center gap-1">
+                  <i class="fa-solid fa-check"></i> Reciprocated
+                </span>
+                <a href="https://mingle2.com/mutual_match/your_matches" target="_blank" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition" title="View in Matches">
+                  <i class="fa-solid fa-arrow-up-right-from-square"></i>
+                </a>
+              </div>
             `;
           } else {
             actionBtn = `

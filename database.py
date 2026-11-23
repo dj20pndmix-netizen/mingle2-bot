@@ -267,6 +267,13 @@ def get_my_account() -> Optional[Dict[str, Any]]:
     conn.close()
     return dict(row) if row else None
 
+def set_account_logged_out():
+    """Marks account as logged out when session expiration or redirect is detected."""
+    conn = get_connection()
+    conn.execute("UPDATE my_account SET is_logged_in = 0 WHERE id = 1")
+    conn.commit()
+    conn.close()
+
 # Discovered Profiles
 def save_discovered_profile(profile_data: Dict[str, Any]):
     user_id = str(profile_data.get("user_id", "")).strip()
@@ -432,6 +439,58 @@ def get_pending_like_backs(limit: int = 50) -> List[Dict[str, Any]]:
     conn.close()
     return [dict(r) for r in rows]
 
+def get_all_pending_fans(limit: int = 100) -> List[Dict[str, Any]]:
+    """Retrieves all pending incoming fans (including blurred fans) awaiting reciprocation."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT user_id, username, photo_url, age, location, received_at
+        FROM likes_received
+        WHERE (liked_back = 0 OR liked_back IS NULL)
+        ORDER BY received_at DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def mark_next_pending_fan_reciprocated(matched_user_id: str = "", matched_username: str = "") -> Optional[str]:
+    """
+    Marks the corresponding incoming fan in likes_received as liked_back = 1
+    when a like is sent or mutual match is confirmed in the Mutual Match stream.
+    Matches exact user_id, username, or consumes the next pending fan.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    
+    # Priority 1: Match by exact user_id if present in likes_received
+    if matched_user_id:
+        row = conn.execute("SELECT user_id FROM likes_received WHERE user_id = ? AND (liked_back = 0 OR liked_back IS NULL)", (str(matched_user_id),)).fetchone()
+        if row:
+            conn.execute("UPDATE likes_received SET liked_back = 1, liked_back_at = ? WHERE user_id = ?", (now, row["user_id"]))
+            conn.commit()
+            conn.close()
+            return row["user_id"]
+
+    # Priority 2: Match by username if known and not generic User_*
+    if matched_username and not str(matched_username).startswith("User_"):
+        row = conn.execute("SELECT user_id FROM likes_received WHERE username = ? AND (liked_back = 0 OR liked_back IS NULL)", (str(matched_username),)).fetchone()
+        if row:
+            conn.execute("UPDATE likes_received SET liked_back = 1, liked_back_at = ? WHERE user_id = ?", (now, row["user_id"]))
+            conn.commit()
+            conn.close()
+            return row["user_id"]
+
+    # Priority 3: Consume the oldest unreciprocated fan in likes_received
+    row = conn.execute("SELECT user_id FROM likes_received WHERE (liked_back = 0 OR liked_back IS NULL) ORDER BY rowid ASC LIMIT 1").fetchone()
+    if row:
+        fan_id = row["user_id"]
+        conn.execute("UPDATE likes_received SET liked_back = 1, liked_back_at = ? WHERE user_id = ?", (now, fan_id))
+        conn.commit()
+        conn.close()
+        return fan_id
+        
+    conn.close()
+    return None
+
 # Confirmed Mutual Matches
 def record_mutual_match(user_id: str, username: str, photo_url: str = "", age: int = 0, gender: str = "", location: str = "", matched_at: str = "", profile_url: str = ""):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -506,6 +565,7 @@ def get_stats() -> Dict[str, Any]:
     total_discovered = conn.execute("SELECT COUNT(*) FROM target_profiles").fetchone()[0]
     total_likes_sent = conn.execute("SELECT COUNT(*) FROM likes_sent").fetchone()[0]
     db_likes_received = conn.execute("SELECT COUNT(*) FROM likes_received").fetchone()[0]
+    pending_like_backs = conn.execute("SELECT COUNT(*) FROM likes_received WHERE (liked_back = 0 OR liked_back IS NULL)").fetchone()[0]
     total_mutual_liked = conn.execute("SELECT COUNT(*) FROM likes_sent WHERE source = 'like_back'").fetchone()[0]
     total_confirmed_matches = conn.execute("SELECT COUNT(*) FROM mutual_matches").fetchone()[0]
     total_welcomes_sent = conn.execute("SELECT COUNT(*) FROM messages_sent").fetchone()[0]
@@ -520,6 +580,7 @@ def get_stats() -> Dict[str, Any]:
         "total_discovered": total_discovered,
         "total_likes_sent": total_likes_sent,
         "total_likes_received": badge if badge else db_likes_received,
+        "pending_like_backs": pending_like_backs,
         "total_mutual_liked": total_mutual_liked,
         "total_confirmed_matches": total_confirmed_matches,
         "total_welcomes_sent": total_welcomes_sent,

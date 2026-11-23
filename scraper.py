@@ -193,6 +193,16 @@ def parse_mutual_match_page(html: str) -> Dict[str, Any]:
     seen_ids = set()
     badge_count = ""
 
+    # Guard: If this is an unauthenticated landing or login page, do not parse public footer links
+    title_text = (soup.title.get_text() if soup.title else "").lower()
+    if ("login" in title_text or "free online dating" in title_text or "dating site & chat" in title_text) and soup.find("form", action=re.compile(r'verify_login|step1')):
+        return {
+            "users": [],
+            "badge_count": "",
+            "total_parsed": 0,
+            "is_authenticated": False
+        }
+
     # 1. Extract Badge Count specifically from Mutual Match dropdown or 'Who clicked YES on you'
     for ann in soup.find_all(class_="annotation"):
         parent_text = (ann.parent.get_text() or "").lower() if ann.parent else ""
@@ -286,31 +296,38 @@ def parse_mutual_match_page(html: str) -> Dict[str, Any]:
             "is_fan_item": True
         })
 
-    # 3. Parse direct user links if any (<a href="/users/view/<id>">)
-    links = soup.find_all("a", href=re.compile(r'/(?:users|user)/view/(\d+)'))
-    for link in links:
-        href = link.get("href", "")
-        m = re.search(r'/(?:users|user)/view/(\d+)', href)
-        if not m:
-            continue
-        uid = m.group(1)
-        if uid in seen_ids:
-            continue
-        seen_ids.add(uid)
+    # 3. Parse direct user links if any (<a href="/users/view/<id>">) ONLY within match/fan gallery containers
+    match_container = (
+        soup.find(id="list-your-matches") or 
+        soup.find(class_="gallery-users") or 
+        soup.find(id="who-liked-me-container") or
+        soup.find(class_=re.compile(r'fan-list|mutual_match_container'))
+    )
+    if match_container:
+        links = match_container.find_all("a", href=re.compile(r'/(?:users|user)/view/(\d+)'))
+        for link in links:
+            href = link.get("href", "")
+            m = re.search(r'/(?:users|user)/view/(\d+)', href)
+            if not m:
+                continue
+            uid = m.group(1)
+            if uid in seen_ids:
+                continue
+            seen_ids.add(uid)
 
-        parent = link.find_parent("div") or link
-        username = clean_text(link.get_text())
-        img = parent.find("img")
-        photo_url = img.get("src", "") if img else ""
+            parent = link.find_parent("div") or link
+            username = clean_text(link.get_text())
+            img = parent.find("img")
+            photo_url = img.get("src", "") if img else ""
 
-        users.append({
-            "user_id": uid,
-            "rating_id": "",
-            "username": username or f"User_{uid}",
-            "profile_url": f"https://mingle2.com/users/view/{uid}",
-            "photo_url": photo_url,
-            "is_fan_item": False
-        })
+            users.append({
+                "user_id": uid,
+                "rating_id": "",
+                "username": username or f"User_{uid}",
+                "profile_url": f"https://mingle2.com/users/view/{uid}",
+                "photo_url": photo_url,
+                "is_fan_item": False
+            })
 
     return {
         "users": users,

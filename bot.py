@@ -189,6 +189,30 @@ def safe_goto(page: Page, url: str, timeout: int = 30000, max_retries: int = 3, 
                 return False
     return False
 
+def check_session_alive(page: Page) -> bool:
+    """
+    Actively verifies if the current page session is authenticated.
+    Detects if Mingle2 redirected to /user/step1, /user/login, or displayed login forms.
+    If session expired: logs warning, marks account logged out, and returns False.
+    """
+    try:
+        url = (page.url or "").lower()
+        if "/step1" in url or "/login" in url or "verify_login" in url:
+            db.log_activity("Mingle2 session has expired or requires authentication. Please log in via the dashboard Sign In button.", level="WARNING")
+            db.set_account_logged_out()
+            return False
+
+        # DOM check for login elements
+        has_login = safe_evaluate(page, "() => { return !!document.querySelector('form[action*=\"verify_login\"], input[name=\"login\"], input[name=\"user[login]\"]'); }")
+        if has_login:
+            db.log_activity("Mingle2 session expired (login form presented). Please log in via the dashboard.", level="WARNING")
+            db.set_account_logged_out()
+            return False
+
+        return True
+    except Exception:
+        return True
+
 def save_session(context: BrowserContext):
     """Saves browser cookies and storage state for future unattended logins."""
     os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
@@ -544,7 +568,7 @@ def _sync_incoming_likes(page: Page) -> Dict[str, Any]:
     """Scrapes live incoming likes count badge and fans list from Mingle2."""
     try:
         ok = safe_goto(page, "https://mingle2.com/mutual_match/who_is_interested_in_me", timeout=25000, wait_until="commit")
-        if not ok:
+        if not ok or not check_session_alive(page):
             return {"badge": "", "fans": []}
             
         content = page.content()
@@ -554,6 +578,8 @@ def _sync_incoming_likes(page: Page) -> Dict[str, Any]:
         # If badge not found on who_is_interested, check /mutual_match
         if not badge:
             safe_goto(page, "https://mingle2.com/mutual_match", timeout=20000, wait_until="commit")
+            if not check_session_alive(page):
+                return {"badge": "", "fans": []}
             p2 = scraper.parse_mutual_match_page(page.content())
             badge = p2.get("badge_count", "")
             
@@ -581,7 +607,7 @@ def _sync_your_matches(page: Page) -> List[Dict[str, Any]]:
     """Scrapes confirmed mutual matches from Mingle2 /mutual_match/your_matches."""
     try:
         ok = safe_goto(page, "https://mingle2.com/mutual_match/your_matches", timeout=25000, wait_until="commit")
-        if not ok:
+        if not ok or not check_session_alive(page):
             return []
         page.wait_for_timeout(2500)
         dismiss_popups(page)
@@ -598,6 +624,8 @@ def _sync_your_matches(page: Page) -> List[Dict[str, Any]]:
                 matched_at=m.get("matched_at", ""),
                 profile_url=m.get("profile_url", "")
             )
+            # Reciprocate / mark corresponding fan in likes_received
+            db.mark_next_pending_fan_reciprocated(matched_user_id=m["user_id"], matched_username=m["username"])
         if matches:
             db.log_activity(f"Synchronized {len(matches)} Confirmed Mutual Matches from Mingle2!", level="SUCCESS")
         return matches
@@ -875,17 +903,24 @@ def _click_like_button(page: Page, user_id: str = "", username: str = "") -> Tup
             data = eval_res.get("data") if eval_res.get("data") is not None else eval_res
             if isinstance(data, dict) and (data.get("is_mutual") or data.get("mutual_match_connection_id")):
                 is_mutual = True
+                db.log_activity(f"MUTUAL MATCH CONFIRMED via API for {username or uid} (ID: {uid})! 🎉", level="MATCH", user_id=uid)
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                db.record_mutual_match(user_id=uid, username=username, profile_url=f"https://mingle2.com/users/view/{uid}", matched_at=now_str)
+                db.mark_liked_back(uid)
+                db.mark_next_pending_fan_reciprocated(matched_user_id=uid, matched_username=username)
     except Exception as e:
         db.log_activity(f"AJAX rate_only attempt notice for user {uid}: {e}", level="DEBUG", user_id=uid)
 
-    # 3. Method B: Fallback click on #rate-yes
-    if not liked:
-        btn = safe_query_selector(page, "#rate-yes, a.rate-btn[data-id]")
-        if btn and btn.is_visible():
+    # 3. Method B: Direct click on #rate-yes to trigger UI swipe animation & advance card
+    btn = safe_query_selector(page, "#rate-yes, a.rate-btn[data-id], button[data-recaptcha-action='like'], a.rate-btn.yes, .rate-yes-btn")
+    if btn and btn.is_visible():
+        try:
+            btn.click(force=True, timeout=3000)
+            liked = True
+        except Exception:
             try:
-                btn.click(force=True, timeout=4000)
+                safe_evaluate(page, "() => { const b = document.querySelector('#rate-yes, a.rate-btn[data-id], button[data-recaptcha-action=\"like\"], a.rate-btn.yes'); if (b) b.click(); }")
                 liked = True
-                page.wait_for_timeout(2000)
             except Exception:
                 pass
 
@@ -916,6 +951,12 @@ def run_like_back(max_likes: int = 30) -> int:
         context = create_context(p, headless=True)
         page = context.new_page()
         try:
+            # 0. Check session validity first
+            safe_goto(page, "https://mingle2.com/mutual_match", timeout=25000, wait_until="commit")
+            if not check_session_alive(page):
+                db.log_activity("Mingle2 session is not active or has expired. Please log in before running Like-Back.", level="WARNING")
+                return 0
+
             # 1. Sync live incoming likes & fans
             _sync_incoming_likes(page)
             
@@ -981,7 +1022,7 @@ def run_like_back(max_likes: int = 30) -> int:
             if liked_count < max_likes and not is_stopped():
                 db.log_activity(f"Continuing Like Back in Mutual Match Stream: https://mingle2.com/mutual_match/match ({max_likes - liked_count} remaining)...", level="INFO")
                 ok = safe_goto(page, "https://mingle2.com/mutual_match/match", timeout=25000, wait_until="commit")
-                if ok:
+                if ok and check_session_alive(page):
                     try:
                         page.wait_for_load_state("domcontentloaded", timeout=8000)
                     except Exception:
@@ -1002,7 +1043,13 @@ def run_like_back(max_likes: int = 30) -> int:
                             m = re.search(r'match/(\d+)', current_url)
                             uid = m.group(1) if m else ""
                             
-                            # Priority 1: Check rate form action /mutual_match/rate/<id> (exact active swipe target)
+                            # Priority 1: Check rate-yes button data-id or data-user-id
+                            if not uid:
+                                rate_btn = safe_query_selector(page, "#rate-yes[data-id], button[data-recaptcha-action='like'][data-id], a.rate-btn[data-id], a.rate-btn.yes[data-id]")
+                                if rate_btn:
+                                    uid = (rate_btn.get_attribute("data-id") or "").strip()
+
+                            # Priority 2: Check rate form action /mutual_match/rate/<id>
                             if not uid:
                                 rate_form = safe_query_selector(page, "form[action*='/mutual_match/rate/']")
                                 if rate_form:
@@ -1011,7 +1058,7 @@ def run_like_back(max_likes: int = 30) -> int:
                                     if m_form:
                                         uid = m_form.group(1)
 
-                            # Priority 2: Check profile link on active card
+                            # Priority 3: Check profile link on active card
                             if not uid:
                                 a_link = safe_query_selector(page, ".match-portrait a[href*='/users/view/'], a[href*='/users/view/'], a[href*='/user/view/']")
                                 if a_link:
@@ -1020,8 +1067,31 @@ def run_like_back(max_likes: int = 30) -> int:
                                     if m_link:
                                         uid = m_link.group(1)
 
+                            # Priority 4: Hidden input id/user_id/candidate_id
                             if not uid:
-                                db.log_activity("No more match candidates in current stream.", level="INFO")
+                                hidden_inp = safe_query_selector(page, "input[name='id'], input[name='user_id'], input[name='candidate_id']")
+                                if hidden_inp:
+                                    uid = (hidden_inp.get_attribute("value") or "").strip()
+
+                            # Priority 5: DOM element data-candidate-id / data-user-id
+                            if not uid:
+                                container_el = safe_query_selector(page, "[data-candidate-id], [data-user-id]")
+                                if container_el:
+                                    uid = (container_el.get_attribute("data-candidate-id") or container_el.get_attribute("data-user-id") or "").strip()
+
+                            # If still not found, wait briefly and retry
+                            if not uid:
+                                page.wait_for_timeout(2000)
+                                r_btn = safe_query_selector(page, "#rate-yes[data-id], a.rate-btn[data-id]")
+                                if r_btn:
+                                    uid = (r_btn.get_attribute("data-id") or "").strip()
+
+                            if not uid:
+                                no_match_text = safe_evaluate(page, "() => document.body ? document.body.innerText : ''")
+                                if any(k in no_match_text.lower() for k in ["no more", "come back later", "seen all", "no matches"]):
+                                    db.log_activity("All candidates in the Mutual Match stream have been reviewed.", level="INFO")
+                                else:
+                                    db.log_activity("No active candidate detected in Mutual Match stream.", level="INFO")
                                 break
 
                             username = f"User_{uid}"
@@ -1035,13 +1105,13 @@ def run_like_back(max_likes: int = 30) -> int:
                                     pass
 
                             if db.has_already_liked(uid):
-                                db.log_activity(f"Skipping {username} (ID: {uid}) - Already liked.", level="DEBUG", user_id=uid)
-                                skip_btn = safe_query_selector(page, "button[data-recaptcha-action='skip'], .rate-no-btn")
+                                db.log_activity(f"Candidate {username} (ID: {uid}) was already liked. Advancing card...", level="DEBUG", user_id=uid)
+                                skip_btn = safe_query_selector(page, "button[data-recaptcha-action='skip'], #rate-no, .rate-no-btn")
                                 if skip_btn and skip_btn.is_visible():
                                     try:
                                         skip_btn.click(force=True, timeout=3000)
                                     except Exception:
-                                        safe_evaluate(page, "() => { const b = document.querySelector('button[data-recaptcha-action=\"skip\"], .rate-no-btn'); if (b) b.click(); }")
+                                        safe_evaluate(page, "() => { const b = document.querySelector('button[data-recaptcha-action=\"skip\"], #rate-no, .rate-no-btn'); if (b) b.click(); }")
                                 else:
                                     page.goto("https://mingle2.com/mutual_match/match", wait_until="commit", timeout=20000)
                                 
@@ -1051,7 +1121,7 @@ def run_like_back(max_likes: int = 30) -> int:
                                     page.wait_for_timeout(2000)
                                 continue
 
-                            db.log_activity(f"Executing Mutual Match LIKE for {username} (ID: {uid})...", level="INFO", user_id=uid)
+                            db.log_activity(f"Reciprocating like for candidate {username} (ID: {uid}) in Mutual Match stream...", level="INFO", user_id=uid)
                             
                             # Execute verified like with AJAX rate_only + button click
                             liked, is_mutual = _click_like_button(page, user_id=uid, username=username)
@@ -1061,11 +1131,12 @@ def run_like_back(max_likes: int = 30) -> int:
                                     user_id=uid,
                                     username=username,
                                     source="like_back",
-                                    matched_criteria={"reason": "Mutual Match Stream"}
+                                    matched_criteria={"reason": "Mutual Match Stream (Fan Reciprocated)"}
                                 )
-                                db.mark_liked_back(uid)
+                                # Reciprocate the next pending fan in likes_received
+                                reciprocated_fan_id = db.mark_next_pending_fan_reciprocated(matched_user_id=uid, matched_username=username)
                                 liked_count += 1
-                                db.log_activity(f"Successfully liked {username} (ID: {uid}) [{liked_count}/{max_likes}]", level="SUCCESS", user_id=uid)
+                                db.log_activity(f"Successfully liked back candidate {username} (ID: {uid}) [{liked_count}/{max_likes}]", level="SUCCESS", user_id=uid)
                                 if is_mutual:
                                     db.record_mutual_match(
                                         user_id=uid,
@@ -1078,6 +1149,13 @@ def run_like_back(max_likes: int = 30) -> int:
                                         send_welcome_message(page, user_id=uid, username=username, message_text=w_msg)
 
                             human_delay(1.5, 3.0)
+
+                            # Verify page has advanced; if still showing same card, reload stream
+                            page.wait_for_timeout(1000)
+                            chk_btn = safe_query_selector(page, "#rate-yes[data-id], a.rate-btn[data-id]")
+                            if chk_btn and (chk_btn.get_attribute("data-id") or "").strip() == uid:
+                                safe_goto(page, "https://mingle2.com/mutual_match/match", timeout=20000, wait_until="commit")
+                                page.wait_for_timeout(1500)
 
                         except Exception as candidate_err:
                             err_str = str(candidate_err)
@@ -1161,6 +1239,9 @@ def search_and_like(max_likes: int = 30) -> int:
                     db.log_activity(f"Scanning candidates on [{stream_name}] Page {page_num}...", level="INFO")
                     
                     if safe_goto(page, stream_url, timeout=20000, wait_until="commit"):
+                        if not check_session_alive(page):
+                            db.log_activity("Mingle2 session has expired. Halting Search & Auto-Like.", level="WARNING")
+                            return liked_count
                         content = page.content()
                         found = scraper.parse_search_results(content)
                         
