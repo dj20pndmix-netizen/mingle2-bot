@@ -575,9 +575,9 @@ def _sync_incoming_likes(page: Page) -> Dict[str, Any]:
         parsed = scraper.parse_mutual_match_page(content)
         badge = parsed.get("badge_count", "")
         
-        # If badge not found on who_is_interested, check /mutual_match
+        # If badge not found on who_is_interested, check /mutual_match/match
         if not badge:
-            safe_goto(page, "https://mingle2.com/mutual_match", timeout=20000, wait_until="commit")
+            safe_goto(page, "https://mingle2.com/mutual_match/match", timeout=20000, wait_until="commit")
             if not check_session_alive(page):
                 return {"badge": "", "fans": []}
             p2 = scraper.parse_mutual_match_page(page.content())
@@ -624,8 +624,6 @@ def _sync_your_matches(page: Page) -> List[Dict[str, Any]]:
                 matched_at=m.get("matched_at", ""),
                 profile_url=m.get("profile_url", "")
             )
-            # Reciprocate / mark corresponding fan in likes_received
-            db.mark_next_pending_fan_reciprocated(matched_user_id=m["user_id"], matched_username=m["username"])
         if matches:
             db.log_activity(f"Synchronized {len(matches)} Confirmed Mutual Matches from Mingle2!", level="SUCCESS")
         return matches
@@ -952,7 +950,7 @@ def run_like_back(max_likes: int = 30) -> int:
         page = context.new_page()
         try:
             # 0. Check session validity first
-            safe_goto(page, "https://mingle2.com/mutual_match", timeout=25000, wait_until="commit")
+            safe_goto(page, "https://mingle2.com/user/edit_profile", timeout=25000, wait_until="commit")
             if not check_session_alive(page):
                 db.log_activity("Mingle2 session is not active or has expired. Please log in before running Like-Back.", level="WARNING")
                 return 0
@@ -963,21 +961,17 @@ def run_like_back(max_likes: int = 30) -> int:
             # Sync verified mutual matches directly from Mingle2
             _sync_your_matches(page)
             
-            # 2. PHASE 1: Like back actual users who liked our profile from likes_received
+            # 2. PHASE 1: Like back actual unblurred users who liked our profile from likes_received
             pending_fans = db.get_pending_like_backs(limit=max_likes)
-            if pending_fans:
-                db.log_activity(f"Found {len(pending_fans)} pending unblurred fans who liked you! Prioritizing Like-Back for guaranteed mutual matches...", level="INFO")
-                for fan in pending_fans:
+            unblurred_fans = [f for f in pending_fans if str(f.get("user_id", "")).isdigit() and not str(f.get("user_id", "")).startswith(("fan_", "blurred_"))]
+            if unblurred_fans:
+                db.log_activity(f"Found {len(unblurred_fans)} unblurred fan profiles. Liking them back directly...", level="INFO")
+                for fan in unblurred_fans:
                     if is_stopped() or liked_count >= max_likes:
                         break
                     
                     f_uid = str(fan["user_id"]).strip()
                     f_name = fan.get("username") or f"User_{f_uid}"
-                    
-                    # Ensure f_uid is a real numeric Mingle2 user ID
-                    if not f_uid.isdigit() or f_uid.startswith(("fan_", "blurred_")):
-                        db.mark_liked_back(f_uid)
-                        continue
                     
                     if db.has_already_liked(f_uid):
                         db.mark_liked_back(f_uid)
@@ -1017,6 +1011,8 @@ def run_like_back(max_likes: int = 30) -> int:
                             )
                     
                     human_delay(1.5, 3.0)
+            elif pending_fans:
+                db.log_activity(f"{len(pending_fans)} incoming fans are blurred on free tier; matching them live in Mutual Match stream...", level="INFO")
 
             # 3. PHASE 2: If we still have likes remaining, explore live Mutual Match stream (/mutual_match/match)
             if liked_count < max_likes and not is_stopped():
@@ -1133,8 +1129,6 @@ def run_like_back(max_likes: int = 30) -> int:
                                     source="like_back",
                                     matched_criteria={"reason": "Mutual Match Stream (Fan Reciprocated)"}
                                 )
-                                # Reciprocate the next pending fan in likes_received
-                                reciprocated_fan_id = db.mark_next_pending_fan_reciprocated(matched_user_id=uid, matched_username=username)
                                 liked_count += 1
                                 db.log_activity(f"Successfully liked back candidate {username} (ID: {uid}) [{liked_count}/{max_likes}]", level="SUCCESS", user_id=uid)
                                 if is_mutual:
@@ -1143,6 +1137,8 @@ def run_like_back(max_likes: int = 30) -> int:
                                         username=username,
                                         profile_url=f"https://mingle2.com/users/view/{uid}"
                                     )
+                                    db.mark_liked_back(uid)
+                                    reciprocated_fan_id = db.mark_next_pending_fan_reciprocated(matched_user_id=uid, matched_username=username)
                                     cfg = db.get_config()
                                     if cfg.get("auto_welcome", True) and not db.has_received_welcome(uid):
                                         w_msg = cfg.get("welcome_message") or "Hey! Nice to match with you 😊"

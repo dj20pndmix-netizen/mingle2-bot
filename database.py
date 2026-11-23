@@ -455,8 +455,8 @@ def get_all_pending_fans(limit: int = 100) -> List[Dict[str, Any]]:
 def mark_next_pending_fan_reciprocated(matched_user_id: str = "", matched_username: str = "") -> Optional[str]:
     """
     Marks the corresponding incoming fan in likes_received as liked_back = 1
-    when a like is sent or mutual match is confirmed in the Mutual Match stream.
-    Matches exact user_id, username, or consumes the next pending fan.
+    ONLY IF there is an actual matching user_id or matching username.
+    Never blindly consumes unrelated fans.
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
@@ -470,8 +470,8 @@ def mark_next_pending_fan_reciprocated(matched_user_id: str = "", matched_userna
             conn.close()
             return row["user_id"]
 
-    # Priority 2: Match by username if known and not generic User_*
-    if matched_username and not str(matched_username).startswith("User_"):
+    # Priority 2: Match by username if known and not generic User_* or blurred
+    if matched_username and not str(matched_username).startswith("User_") and "..." not in str(matched_username):
         row = conn.execute("SELECT user_id FROM likes_received WHERE username = ? AND (liked_back = 0 OR liked_back IS NULL)", (str(matched_username),)).fetchone()
         if row:
             conn.execute("UPDATE likes_received SET liked_back = 1, liked_back_at = ? WHERE user_id = ?", (now, row["user_id"]))
@@ -479,15 +479,6 @@ def mark_next_pending_fan_reciprocated(matched_user_id: str = "", matched_userna
             conn.close()
             return row["user_id"]
 
-    # Priority 3: Consume the oldest unreciprocated fan in likes_received
-    row = conn.execute("SELECT user_id FROM likes_received WHERE (liked_back = 0 OR liked_back IS NULL) ORDER BY rowid ASC LIMIT 1").fetchone()
-    if row:
-        fan_id = row["user_id"]
-        conn.execute("UPDATE likes_received SET liked_back = 1, liked_back_at = ? WHERE user_id = ?", (now, fan_id))
-        conn.commit()
-        conn.close()
-        return fan_id
-        
     conn.close()
     return None
 
